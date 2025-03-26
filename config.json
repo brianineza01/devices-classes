@@ -1,0 +1,12 @@
+{
+  "labels": {
+    "load_button": "Load CSV File",
+    "x_axis": "X Axis",
+    "y_axis": "Y Axis"
+  },
+  "titles": {
+    "main_window": "CSV Chart Viewer",
+    "chart": "Data Visualization"
+  },
+  "chart_types": ["line", "bar", "scatter", "step", "stem"]
+}
