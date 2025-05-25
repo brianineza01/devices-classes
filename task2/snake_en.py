@@ -44,6 +44,8 @@ game_active = False  # Changed to False so game doesn't start immediately
 menu_active = True   # New variable to track if we're in the menu
 lives = 3
 score = 0
+score_p1 = 0  # Separate score for player 1
+score_p2 = 0  # Separate score for player 2
 walls_enabled = True
 
 # Player 1 snake
@@ -60,7 +62,7 @@ snake2_moved_in_this_frame = False
 two_player_mode = False
 
 # frames per second
-wps = 10
+wps = 6
 
 # Wall coordinates
 wall_coords = []
@@ -288,12 +290,14 @@ def menu_click(event):
 
 # Reset game state
 def reset_game():
-    global lives, score, snake_coords, snake_tail, snake_move_dir
+    global lives, score, score_p1, score_p2, snake_coords, snake_tail, snake_move_dir
     global snake2_coords, snake2_tail, snake2_move_dir, apple_coords
     
     # Reset game state
     lives = 3
     score = 0
+    score_p1 = 0
+    score_p2 = 0
     
     # Offset for the top info panel
     top_offset = info_height // snake_scale
@@ -323,7 +327,7 @@ def escape_to_menu(e):
 
 # Show game over window
 def show_game_over():
-    global game_active, lives, score, menu_active
+    global game_active, lives, score, score_p1, score_p2, menu_active
     
     game_over_window = tk.Toplevel(snake_window)
     game_over_window.title("Game Over")
@@ -342,7 +346,13 @@ def show_game_over():
         # If image loading fails, show text instead
         tk.Label(game_over_window, text="GAME OVER", font=("Arial", 24, "bold")).pack(pady=20)
     
-    tk.Label(game_over_window, text=f"Final Score: {score}", font=("Arial", 16)).pack(pady=5)
+    if two_player_mode:
+        tk.Label(game_over_window, text=f"Player 1 Score: {score_p1}", font=("Arial", 16)).pack(pady=2)
+        tk.Label(game_over_window, text=f"Player 2 Score: {score_p2}", font=("Arial", 16)).pack(pady=2)
+        winner_text = "Player 1 wins!" if score_p1 > score_p2 else "Player 2 wins!" if score_p2 > score_p1 else "It's a tie!"
+        tk.Label(game_over_window, text=winner_text, font=("Arial", 16, "bold")).pack(pady=5)
+    else:
+        tk.Label(game_over_window, text=f"Final Score: {score}", font=("Arial", 16)).pack(pady=5)
     
     def restart_game():
         global game_active
@@ -394,11 +404,11 @@ def reset_snake(player=1):
     
     if player == 1:
         snake_coords = [game_dimensions[0] // 2, top_offset + game_dimensions[1] // 2]
-        snake_tail = []
+        snake_tail = []  # Clear the tail
         snake_move_dir = [1, 0]
     else:
         snake2_coords = [game_dimensions[0] // 2 - 5, top_offset + game_dimensions[1] // 2]
-        snake2_tail = []
+        snake2_tail = []  # Clear the tail
         snake2_move_dir = [1, 0]
 
 # Toggle two-player mode
@@ -419,7 +429,7 @@ def gameloop():
     global snake_canvas, game_dimensions
     global snake_tail, snake_coords, snake_move_dir
     global snake2_tail, snake2_coords, snake2_move_dir
-    global apple_coords, lives, score, game_active, menu_active, two_player_mode
+    global apple_coords, lives, score, score_p1, score_p2, game_active, menu_active, two_player_mode
 
     # Schedule next frame
     snake_window.after(1000 // wps, gameloop)
@@ -445,8 +455,13 @@ def gameloop():
     draw_walls()
     
     # Display score and lives in the info panel
-    snake_canvas.create_text(70, 25, text=f"Score: {score}", fill="white", font=("Arial", 14))
-    snake_canvas.create_text(70, 55, text=f"Lives: {lives}", fill="white", font=("Arial", 14))
+    if two_player_mode:
+        snake_canvas.create_text(70, 25, text=f"P1 Score: {score_p1}", fill="#00ff00", font=("Arial", 14))
+        snake_canvas.create_text(200, 25, text=f"P2 Score: {score_p2}", fill="#0000ff", font=("Arial", 14))
+        snake_canvas.create_text(70, 55, text=f"Lives: {lives}", fill="white", font=("Arial", 14))
+    else:
+        snake_canvas.create_text(70, 25, text=f"Score: {score}", fill="white", font=("Arial", 14))
+        snake_canvas.create_text(70, 55, text=f"Lives: {lives}", fill="white", font=("Arial", 14))
     
     # Display game mode and controls in the info panel
     if two_player_mode:
@@ -543,19 +558,20 @@ def gameloop():
         
         # Check for collision between snake 1 and snake 2
         if (snake_coords[0] == snake2_coords[0] and snake_coords[1] == snake2_coords[1]):
+            # Both snakes reset in a head-to-head collision
             reset_snake(1)
             reset_snake(2)
         
         # Check if snake 1 hits snake 2's body
         for segment in snake2_tail:
             if (snake_coords[0] == segment[0] and snake_coords[1] == segment[1]):
-                reset_snake(1)
+                reset_snake(1)  # Only snake 1 resets
                 break
         
         # Check if snake 2 hits snake 1's body
         for segment in snake_tail:
             if (snake2_coords[0] == segment[0] and snake2_coords[1] == segment[1]):
-                reset_snake(2)
+                reset_snake(2)  # Only snake 2 resets
                 break
 
     # display an apple
@@ -564,15 +580,26 @@ def gameloop():
     # if an apple was eaten by player 1
     if (apple_coords[0] == snake_coords[0] and apple_coords[1] == snake_coords[1]):
         apple_coords = generateAppleCoords()
-        score += 1
+        if two_player_mode:
+            score_p1 += 1
+        else:
+            score += 1
+        # Don't remove tail segment for player 1 (snake grows)
+        if two_player_mode:
+            # Still remove tail segment for player 2 (no growth)
+            snake2_tail.pop(0)
     # if an apple was eaten by player 2
     elif two_player_mode and (apple_coords[0] == snake2_coords[0] and apple_coords[1] == snake2_coords[1]):
         apple_coords = generateAppleCoords()
-        score += 1
+        score_p2 += 1
+        # Don't remove tail segment for player 2 (snake grows)
+        # Still remove tail segment for player 1 (no growth)
+        snake_tail.pop(0)
     else:
         # Remove tail segment if no apple was eaten
-        snake_tail.pop(0)
-        if two_player_mode:
+        if len(snake_tail) > 0:
+            snake_tail.pop(0)
+        if two_player_mode and len(snake2_tail) > 0:
             snake2_tail.pop(0)
 
 # keyboard for player 1
