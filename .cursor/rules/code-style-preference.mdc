@@ -1,0 +1,16 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+This rule shall always be used for:
+- Code generation
+- refactoring
+
+Rules to follow while generating the code:
+- Little to no comments: The code should be self explainatory and concise so that the comments are useless
+- For python projects please use uv to install packages or run the app
+- For JS/Ts please use pnpm as a package manager
+- For libraries or anything related please refer to the [mcp.json](mdc:/Users/brianineza/.cursor/mcp.json) Context7 mcp for updated documentation.
+- Don't create additional files any more code for documentation or anything related unless asked explicitly.
+
