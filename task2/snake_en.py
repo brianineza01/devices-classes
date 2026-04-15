@@ -4,7 +4,11 @@ import time
 import random
 import math
 from PIL import Image, ImageTk
-from gpiozero import Button
+
+try:
+    from gpiozero import Button
+except ImportError:
+    Button = None
 
 class SnakeGame:
     def __init__(self):
@@ -395,6 +399,10 @@ class SnakeGame:
             pass
 
     def setup_gpio_buttons(self):
+        if Button is None:
+            self.gpio_buttons = {}
+            return
+
         self.gpio_buttons = {
             "up": Button(self.gpio_pins["up"], pull_up=True, bounce_time=0.05),
             "down": Button(self.gpio_pins["down"], pull_up=True, bounce_time=0.05),
