@@ -2,9 +2,9 @@ import tkinter as tk
 from tkinter import messagebox
 import time
 import random
-import sys
 import math
 from PIL import Image, ImageTk
+from gpiozero import Button
 
 class SnakeGame:
     def __init__(self):
@@ -14,7 +14,7 @@ class SnakeGame:
         self.window.geometry(f"{self.win_x}x{self.win_y}")
         self.window.resizable(0, 0)
         self.window.title("Snake")
-        self.window.protocol("WM_DELETE_WINDOW", sys.exit)
+        self.window.protocol("WM_DELETE_WINDOW", self.close_app)
         
         # Canvas setup
         self.canvas = tk.Canvas(self.window, width=self.win_x, height=self.win_y, bd=0, highlightthickness=0)
@@ -37,6 +37,15 @@ class SnakeGame:
         self.walls_enabled = True
         self.two_player_mode = False
         self.frames_per_second = 6
+        self.closing = False
+        self.gpio_pins = {
+            "up": 17,
+            "down": 27,
+            "left": 22,
+            "right": 23,
+            "quit": 24,
+        }
+        self.gpio_buttons = {}
         
         # Initialize players
         self.initialize_players()
@@ -50,6 +59,7 @@ class SnakeGame:
         
         # Set up key bindings
         self.setup_key_bindings()
+        self.setup_gpio_buttons()
         
         # Show the start menu
         self.show_start_menu()
@@ -205,6 +215,7 @@ class SnakeGame:
         - In 2-player mode, avoid colliding with the other snake
         
         Press ESC during gameplay to return to menu
+        RPi: GPIO buttons move Player 1, quit button closes the game
         """
         
         self.canvas.create_text(self.win_x // 2, 300, text=help_text, fill="white", 
@@ -261,7 +272,7 @@ class SnakeGame:
             
         # Exit button
         elif button_x <= x <= button_x + button_width and 460 <= y <= 460 + button_height:
-            sys.exit()
+            self.close_app()
     
     def reset_game(self):
         self.lives = 3
@@ -336,8 +347,67 @@ class SnakeGame:
         menu_button = tk.Button(game_over_window, text="Return to Menu", command=return_to_menu, font=("Arial", 14))
         menu_button.pack(pady=5)
         
-        quit_button = tk.Button(game_over_window, text="Quit Game", command=sys.exit, font=("Arial", 14))
+        quit_button = tk.Button(game_over_window, text="Quit Game", command=self.close_app, font=("Arial", 14))
         quit_button.pack(pady=5)
+
+    def cleanup_gpio_buttons(self):
+        for button in self.gpio_buttons.values():
+            button.close()
+        self.gpio_buttons.clear()
+
+    def close_app(self):
+        if self.closing:
+            return
+
+        self.closing = True
+        self.cleanup_gpio_buttons()
+        self.game_active = False
+        self.window.destroy()
+
+    def set_snake1_direction(self, direction):
+        if not self.game_active or self.menu_active or self.snake1['moved_in_frame']:
+            return
+
+        current_x, current_y = self.snake1['move_dir']
+        next_x, next_y = direction
+        if current_x == -next_x or current_y == -next_y:
+            return
+
+        self.snake1['moved_in_frame'] = True
+        self.snake1['move_dir'] = [next_x, next_y]
+
+    def move_snake1_left(self):
+        self.set_snake1_direction((-1, 0))
+
+    def move_snake1_right(self):
+        self.set_snake1_direction((1, 0))
+
+    def move_snake1_up(self):
+        self.set_snake1_direction((0, -1))
+
+    def move_snake1_down(self):
+        self.set_snake1_direction((0, 1))
+
+    def run_on_main_thread(self, callback):
+        try:
+            self.window.after(0, callback)
+        except tk.TclError:
+            pass
+
+    def setup_gpio_buttons(self):
+        self.gpio_buttons = {
+            "up": Button(self.gpio_pins["up"], pull_up=True, bounce_time=0.05),
+            "down": Button(self.gpio_pins["down"], pull_up=True, bounce_time=0.05),
+            "left": Button(self.gpio_pins["left"], pull_up=True, bounce_time=0.05),
+            "right": Button(self.gpio_pins["right"], pull_up=True, bounce_time=0.05),
+            "quit": Button(self.gpio_pins["quit"], pull_up=True, bounce_time=0.05),
+        }
+
+        self.gpio_buttons["up"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_up)
+        self.gpio_buttons["down"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_down)
+        self.gpio_buttons["left"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_left)
+        self.gpio_buttons["right"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_right)
+        self.gpio_buttons["quit"].when_pressed = lambda: self.run_on_main_thread(self.close_app)
     
     def reset_snake(self, player_num):
         self.lives -= 1
@@ -368,20 +438,14 @@ class SnakeGame:
             self.snake2['move_dir'] = [1, 0]
     
     def handle_snake1_keys(self, event):
-        if not self.snake1['moved_in_frame']:
-            self.snake1['moved_in_frame'] = True
-            
-            # Arrow keys for player 1
-            if event.keysym == "Left" and self.snake1['move_dir'][0] != 1:
-                self.snake1['move_dir'] = [-1, 0]
-            elif event.keysym == "Right" and self.snake1['move_dir'][0] != -1:
-                self.snake1['move_dir'] = [1, 0]
-            elif event.keysym == "Up" and self.snake1['move_dir'][1] != 1:
-                self.snake1['move_dir'] = [0, -1]
-            elif event.keysym == "Down" and self.snake1['move_dir'][1] != -1:
-                self.snake1['move_dir'] = [0, 1]
-            else:
-                self.snake1['moved_in_frame'] = False
+        if event.keysym == "Left":
+            self.move_snake1_left()
+        elif event.keysym == "Right":
+            self.move_snake1_right()
+        elif event.keysym == "Up":
+            self.move_snake1_up()
+        elif event.keysym == "Down":
+            self.move_snake1_down()
     
     def handle_snake2_keys(self, event):
         if not self.two_player_mode:
@@ -429,7 +493,7 @@ class SnakeGame:
         self.canvas.create_text(self.win_x - 100, 25, text="ESC for Menu", fill="white", font=("Arial", 12))
         
         # Display controls reminder
-        controls_text = "P1: Arrows | P2: WASD" if self.two_player_mode else "Controls: Arrow Keys"
+        controls_text = "P1: Arrows/GPIO | P2: WASD" if self.two_player_mode else "Controls: Arrows/GPIO"
         self.canvas.create_text(self.win_x - 100, 55, text=controls_text, fill="white", font=("Arial", 12))
     
     def handle_snake_movement(self, snake, is_player1):
@@ -569,10 +633,11 @@ class SnakeGame:
         self.window.bind("<Button-1>", self.handle_menu_click)
     
     def start(self):
-        # Start the game loop
-        self.game_loop()
-        # Start the main application loop
-        self.window.mainloop()
+        try:
+            self.game_loop()
+            self.window.mainloop()
+        finally:
+            self.cleanup_gpio_buttons()
 
 # Create and start the game
 if __name__ == "__main__":

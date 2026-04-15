@@ -210,33 +210,33 @@ class TextElement(DraggableElement):
             if self.selected:
                 self.select()
     
-    def on_drag(self, event):
-        dx = event.x - self.start_x
-        dy = event.y - self.start_y
+    # def on_drag(self, event):
+    #     dx = event.x - self.start_x
+    #     dy = event.y - self.start_y
         
-        # Update position
-        self.x += dx
-        self.y += dy
+    #     # Update position
+    #     self.x += dx
+    #     self.y += dy
         
-        # Keep within canvas bounds
-        self.x = max(30, min(self.x, 610))
-        self.y = max(30, min(self.y, 450))
+    #     # Keep within canvas bounds
+    #     self.x = max(30, min(self.x, 610))
+    #     self.y = max(30, min(self.y, 450))
         
-        # Move all elements
-        for element in self.elements:
-            self.canvas.move(element, dx, dy)
+    #     # Move all elements
+    #     for element in self.elements:
+    #         self.canvas.move(element, dx, dy)
         
-        # Update wrapper position after moving text
-        if len(self.elements) > 1:
-            bbox = self.canvas.bbox(self.text_id)
-            if bbox:
-                padding = 5
-                self.canvas.coords(self.wrapper_id, 
-                    bbox[0] - padding, bbox[1] - padding,
-                    bbox[2] + padding, bbox[3] + padding)
+    #     # Update wrapper position after moving text
+    #     if len(self.elements) > 1:
+    #         bbox = self.canvas.bbox(self.text_id)
+    #         if bbox:
+    #             padding = 5
+    #             self.canvas.coords(self.wrapper_id, 
+    #                 bbox[0] - padding, bbox[1] - padding,
+    #                 bbox[2] + padding, bbox[3] + padding)
         
-        self.start_x = event.x
-        self.start_y = event.y
+    #     self.start_x = event.x
+    #     self.start_y = event.y
 
 
 class PhotoBooth:
@@ -363,12 +363,8 @@ class PhotoBooth:
         self.rotation_var.trace_add('write', self.on_rotation_change)
         ttk.Scale(parent, from_=-180, to=180, variable=self.rotation_var, orient=tk.HORIZONTAL, length=200).grid(row=0, column=1, padx=5, pady=5)
         
-        ttk.Label(parent, text="Filename:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.filename_var = tk.StringVar(value="photo.jpg")
-        ttk.Entry(parent, textvariable=self.filename_var, width=30).grid(row=1, column=1, padx=5, pady=5)
-        
         button_frame = ttk.Frame(parent)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=1, column=0, columnspan=2, pady=10)
         
         ttk.Button(button_frame, text="Reset", command=self.reset_image).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Clear Elements", command=self.clear_elements).pack(side=tk.LEFT, padx=5)
@@ -649,7 +645,6 @@ class PhotoBooth:
             self.captured_image = self.current_image.copy()
             self.original_captured_image = self.current_image.copy()
             self.update_photo_display()
-            messagebox.showinfo("Photo Taken", "Photo captured successfully!")
         else:
             messagebox.showwarning("No Image", "No image available to capture!")
     
@@ -668,17 +663,95 @@ class PhotoBooth:
             messagebox.showwarning("No Photo", "Please take a photo first!")
             return
         
-        # Create final image with elements rendered
+        # Open file dialog to choose save location and filename
+        file_path = filedialog.asksaveasfilename(
+            title="Save Photo As",
+            defaultextension=".jpg",
+            filetypes=[
+                ("JPEG files", "*.jpg"),
+                ("PNG files", "*.png"),
+                ("All files", "*.*")
+            ],
+            initialdir=".",
+            initialfile="photo.jpg"
+        )
+        
+        if not file_path:
+            return
+        
+        # Create final image
         final_image = self.captured_image.copy()
+        
+        # Apply rotation first if needed
         if self.rotation_var.get() != 0:
             final_image = apply_rotation_to_image(final_image, self.rotation_var.get())
         
-        filename = self.filename_var.get()
-        if not filename.endswith(('.jpg', '.jpeg', '.png')):
-            filename += '.jpg'
+        # Convert to PIL for element rendering
+        img_rgb = cv2.cvtColor(final_image, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
         
-        cv2.imwrite(filename, final_image)
-        messagebox.showinfo("Photo Saved", f"Photo saved as {filename}")
+        # Calculate coordinate adjustments if rotation was applied
+        original_width, original_height = self.image_width, self.image_height
+        new_width, new_height = pil_img.size
+        
+        # Calculate offset for centered rotation
+        x_offset = (new_width - original_width) // 2
+        y_offset = (new_height - original_height) // 2
+        
+        # Render draggable elements (horns, mustache) with coordinate adjustment
+        for element in self.elements:
+            adjusted_x = element.x + x_offset
+            adjusted_y = element.y + y_offset
+            
+            if element.element_type == 'horns':
+                draw_horns(pil_img, adjusted_x, adjusted_y, element.scale)
+            elif element.element_type == 'mustache':
+                draw_mustache(pil_img, adjusted_x, adjusted_y, element.scale)
+        
+        # Render text element with coordinate adjustment
+        if self.text_element and self.text_element.text_content.strip():
+            adjusted_text_x = self.text_element.x + x_offset
+            adjusted_text_y = self.text_element.y + y_offset
+            
+            # Convert hex color to RGB tuple
+            color_hex = self.text_element.text_color
+            if color_hex.startswith('#'):
+                color_hex = color_hex[1:]
+                text_color_rgb = tuple(int(color_hex[i:i+2], 16) for i in (0, 2, 4))
+            else:
+                # Handle named colors
+                color_map = {
+                    'white': (255, 255, 255),
+                    'black': (0, 0, 0),
+                    'red': (255, 0, 0),
+                    'green': (0, 255, 0),
+                    'blue': (0, 0, 255),
+                    'yellow': (255, 255, 0),
+                    'cyan': (0, 255, 255),
+                    'magenta': (255, 0, 255)
+                }
+                text_color_rgb = color_map.get(color_hex.lower(), (255, 255, 255))
+            
+            add_text_overlay(
+                pil_img, 
+                self.text_element.text_content,
+                self.text_element.font_size,
+                text_color_rgb,
+                "custom",
+                self.text_element.bold,
+                self.text_element.italic,
+                adjusted_text_x,
+                adjusted_text_y
+            )
+        
+        # Convert back to OpenCV format and save
+        try:
+            final_img = np.array(pil_img)
+            final_img_bgr = cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(file_path, final_img_bgr)
+            messagebox.showinfo("Photo Saved", f"Photo saved as {file_path}")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save photo: {str(e)}")
     
     def reset_image(self):
         self.captured_image = None
