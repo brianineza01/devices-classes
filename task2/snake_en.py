@@ -400,11 +400,11 @@ class SnakeGame:
             return
 
         self.gpio_buttons = {
-            "up": Button(self.gpio_pins["up"], pull_up=True, bounce_time=0.05),
-            "down": Button(self.gpio_pins["down"], pull_up=True, bounce_time=0.05),
-            "left": Button(self.gpio_pins["left"], pull_up=True, bounce_time=0.05),
-            "right": Button(self.gpio_pins["right"], pull_up=True, bounce_time=0.05),
-            "quit": Button(self.gpio_pins["quit"], pull_up=True, bounce_time=0.05),
+            "up": Button(self.gpio_pins["up"], pull_up=False, bounce_time=0.05),
+            "down": Button(self.gpio_pins["down"], pull_up=False, bounce_time=0.05),
+            "left": Button(self.gpio_pins["left"], pull_up=False, bounce_time=0.05),
+            "right": Button(self.gpio_pins["right"], pull_up=False, bounce_time=0.05),
+            "quit": Button(self.gpio_pins["quit"], pull_up=False, bounce_time=0.05),
         }
 
         self.gpio_buttons["up"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_up)
