@@ -394,6 +394,10 @@ class SnakeGame:
         except tk.TclError:
             pass
 
+    def handle_gpio_button_press(self, button_name, callback):
+        print(f"GPIO button pressed: {button_name}")
+        self.run_on_main_thread(callback)
+
     def setup_gpio_buttons(self):
         if Button is None:
             self.gpio_buttons = {}
@@ -407,11 +411,11 @@ class SnakeGame:
             "quit": Button(self.gpio_pins["quit"], pull_up=False, bounce_time=0.05),
         }
 
-        self.gpio_buttons["up"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_up)
-        self.gpio_buttons["down"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_down)
-        self.gpio_buttons["left"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_left)
-        self.gpio_buttons["right"].when_pressed = lambda: self.run_on_main_thread(self.move_snake1_right)
-        self.gpio_buttons["quit"].when_pressed = lambda: self.run_on_main_thread(self.close_app)
+        self.gpio_buttons["up"].when_pressed = lambda: self.handle_gpio_button_press("up", self.move_snake1_up)
+        self.gpio_buttons["down"].when_pressed = lambda: self.handle_gpio_button_press("down", self.move_snake1_down)
+        self.gpio_buttons["left"].when_pressed = lambda: self.handle_gpio_button_press("left", self.move_snake1_left)
+        self.gpio_buttons["right"].when_pressed = lambda: self.handle_gpio_button_press("right", self.move_snake1_right)
+        self.gpio_buttons["quit"].when_pressed = lambda: self.handle_gpio_button_press("quit", self.close_app)
     
     def reset_snake(self, player_num):
         self.lives -= 1
