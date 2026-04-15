@@ -23,7 +23,7 @@ def main():
 
     try:
         for name, pin in GPIO_PINS.items():
-            button = Button(pin, pull_up=True, bounce_time=0.05)
+            button = Button(pin, pull_up=false, bounce_time=0.05)
             button.when_pressed = lambda button_name=name: print(f"{button_name}: pressed")
             button.when_released = lambda button_name=name: print(f"{button_name}: released")
             buttons[name] = button
