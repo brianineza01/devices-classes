@@ -4,11 +4,7 @@ import time
 import random
 import math
 from PIL import Image, ImageTk
-
-try:
-    from gpiozero import Button
-except ImportError:
-    Button = None
+from gpiozero import Button
 
 class SnakeGame:
     def __init__(self):
