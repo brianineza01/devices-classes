@@ -1,0 +1,147 @@
+import base64
+import io
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import tkinter as tk
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+CHART_TYPES = ["line", "bar", "scatter", "step", "stem"]
+DEFAULT_CHART_TYPE = "line"
+
+
+class RandomSensorApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Random Temperature & Pressure")
+        self.root.geometry("1000x800")
+        self.data = None
+        self.chart_type_var = tk.StringVar(self.root)
+        self.chart_type_var.set(DEFAULT_CHART_TYPE)
+        self.figure = Figure(figsize=(9, 8), dpi=100)
+        self.figure_canvas = FigureCanvasAgg(self.figure)
+        self.chart_photo = None
+
+        top = tk.Frame(self.root)
+        top.pack(pady=5, padx=10, fill="x")
+        tk.Button(top, text="Generate data", command=self.generate_and_render).pack(side="left")
+        tk.Label(top, text="Samples:").pack(side="left", padx=(12, 2))
+        self.samples_var = tk.StringVar(value="60")
+        tk.Entry(top, textvariable=self.samples_var, width=8).pack(side="left")
+        tk.Label(top, text="Chart type:").pack(side="left", padx=(12, 2))
+        tk.OptionMenu(top, self.chart_type_var, *CHART_TYPES, command=self.on_chart_type_change).pack(side="left")
+
+        render = tk.Frame(self.root)
+        render.pack(pady=5, padx=10, fill="x")
+        tk.Button(render, text="Render charts", command=self.update_chart).pack()
+        self.status_label = tk.Label(render, text="Generating random sensor data")
+        self.status_label.pack(pady=(8, 0))
+
+        self.chart_frame = tk.Frame(self.root)
+        self.chart_frame.pack(pady=5, padx=10, fill="both", expand=True)
+        self.chart_label = tk.Label(self.chart_frame)
+        self.chart_label.pack(fill="both", expand=True)
+
+        self.generate_data()
+        self.update_chart()
+
+    def generate_data(self):
+        try:
+            n = int(self.samples_var.get())
+        except ValueError:
+            n = 60
+        n = max(2, min(n, 10_000))
+        rng = np.random.default_rng()
+        times = pd.date_range(start="2024-01-01", periods=n, freq="min")
+        self.data = pd.DataFrame(
+            {
+                "time": times,
+                "temperature_c": 20 + rng.standard_normal(n) * 3,
+                "pressure_hpa": 1013 + rng.standard_normal(n) * 5,
+            }
+        )
+        self.status_label.config(text=f"Generated {n} samples")
+
+    def on_chart_type_change(self, _event=None):
+        self.update_chart()
+
+    def generate_and_render(self):
+        self.generate_data()
+        self.update_chart()
+
+    def create_chart_figure(self):
+        self.figure.clear()
+        ax1 = self.figure.add_subplot(211)
+        ax2 = self.figure.add_subplot(212, sharex=ax1)
+        self.figure.subplots_adjust(hspace=0.3, bottom=0.12)
+        return ax1, ax2
+
+    def _draw_series(self, ax, x, y):
+        current = self.chart_type_var.get()
+        if current == "line":
+            sns.lineplot(x=x, y=y, ax=ax)
+            ax.scatter(x, y, color="red", s=50, zorder=5)
+        elif current == "bar":
+            sns.barplot(x=x, y=y, ax=ax)
+            for i, bar in enumerate(ax.patches):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    f"{y.iloc[i]:.2f}",
+                    ha="center",
+                    va="bottom",
+                )
+        elif current == "scatter":
+            sns.scatterplot(x=x, y=y, ax=ax)
+            for xi, yi in zip(x, y):
+                ax.annotate(
+                    f"({xi}, {yi:.2f})",
+                    (xi, yi),
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                )
+        elif current == "step":
+            ax.step(x, y, where="post")
+            ax.scatter(x, y, color="red", s=50, zorder=5)
+        elif current == "stem":
+            ax.stem(x, y)
+
+    def update_chart(self):
+        ax1, ax2 = self.create_chart_figure()
+        if self.data is None:
+            self.status_label.config(text="No data to render")
+            self._display_figure()
+            return
+        x = self.data["time"]
+        y_temp = self.data["temperature_c"]
+        y_press = self.data["pressure_hpa"]
+        self._draw_series(ax1, x, y_temp)
+        self._draw_series(ax2, x, y_press)
+        ax1.set_title("Temperature")
+        ax1.set_ylabel("C")
+        ax2.set_title("Pressure")
+        ax2.set_ylabel("hPa")
+        ax2.set_xlabel("Time")
+        ax1.tick_params(axis="x", labelbottom=False)
+        ax2.tick_params(axis="x", rotation=30)
+        self._display_figure()
+        self.status_label.config(text=f"Showing {self.chart_type_var.get()} charts")
+
+    def _display_figure(self):
+        self.figure_canvas.draw()
+        buf = io.BytesIO()
+        self.figure.savefig(buf, format="png")
+        buf.seek(0)
+        self.chart_photo = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+        self.chart_label.config(image=self.chart_photo)
+
+
+def run():
+    app = RandomSensorApp()
+    app.root.mainloop()
+
+
+if __name__ == "__main__":
+    run()
