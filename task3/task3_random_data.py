@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
@@ -127,7 +128,7 @@ class SensorAppState:
     chart_types: dict[str, str]
     markers: dict[str, tuple[ChartMarker, ...]]
     marker_selected_index: dict[str, int | None]
-    grid_visible: bool = True
+    grid_visible: dict[str, bool]
 
 
 def normalize_chart_type(value: str) -> str:
@@ -155,6 +156,27 @@ def interpolate_x_coord(x_coords: list[object], frac: float) -> object:
     return float(a) + (float(b) - float(a)) * frac
 
 
+def marker_axes_x(ax, chart_type: str, x_coords: list[object], frac: float) -> object:
+    ct = normalize_chart_type(chart_type)
+    n = len(x_coords)
+    if ct == "bar" and n > 0:
+        patches = ax.patches
+        if len(patches) >= n:
+            pos = max(0.0, min(1.0, frac)) * (n - 1)
+            i0 = int(math.floor(pos))
+            i1 = min(i0 + 1, n - 1)
+            t = pos - i0
+
+            def bar_center(i: int) -> float:
+                p = patches[i]
+                return float(p.get_x() + p.get_width() / 2)
+
+            if i0 == i1:
+                return bar_center(i0)
+            return bar_center(i0) * (1.0 - t) + bar_center(i1) * t
+    return interpolate_x_coord(x_coords, frac)
+
+
 def float_bounds_from_numeric(y_numeric: Iterable[object]) -> tuple[float, float]:
     ys = [float(v) for v in y_numeric]
     lo = min(ys)
@@ -169,6 +191,7 @@ def float_bounds_from_numeric(y_numeric: Iterable[object]) -> tuple[float, float
 def draw_seaborn_markers(
     ax,
     *,
+    chart_type: str,
     markers: tuple[ChartMarker, ...],
     x_coords: list[object],
     selected_index: int | None,
@@ -177,21 +200,20 @@ def draw_seaborn_markers(
     if not markers:
         return
     palette = sns.color_palette("deep", max(len(markers), 3))
+    ct = normalize_chart_type(chart_type)
     for i, m in enumerate(markers):
-        xv = interpolate_x_coord(x_coords, m.x_frac)
+        xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
         st = normalize_marker_style(m.style)
         sel = selected_index is not None and i == selected_index
-        sns.scatterplot(
-            x=[xv],
-            y=[m.y_value],
-            ax=ax,
+        ax.scatter(
+            [xv],
+            [m.y_value],
             marker=st,
             s=220 if sel else 160,
             color=palette[i % len(palette)],
-            edgecolor="black",
+            edgecolors="black",
             linewidths=3.6 if sel else 0.9,
             zorder=16 if sel else 15,
-            legend=False,
         )
     if (
         selected_caption
@@ -199,7 +221,7 @@ def draw_seaborn_markers(
         and 0 <= selected_index < len(markers)
     ):
         m = markers[selected_index]
-        xv = interpolate_x_coord(x_coords, m.x_frac)
+        xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
         ax.annotate(
             selected_caption,
             (xv, m.y_value),
@@ -417,6 +439,7 @@ def render_chart_figure(
                 caption = f"{tup[0]}\n{tup[1]}"
         draw_seaborn_markers(
             ax,
+            chart_type=chart_type,
             markers=markers,
             x_coords=x,
             selected_index=marker_selected_index,
@@ -451,7 +474,8 @@ def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> s
         rows = state.datasets.get(key)
         n = len(rows) if rows else 0
         ct = normalize_chart_type(state.chart_types.get(pid, DEFAULT_CHART_TYPE))
-        parts.append(f"{pid}: {ct} ({n} rows)")
+        g = "on" if state.grid_visible.get(pid, True) else "off"
+        parts.append(f"{pid}: {ct} grid {g} ({n} rows)")
     return " · ".join(parts)
 
 
@@ -521,6 +545,7 @@ class RandomSensorApp:
         self.marker_readout_x_labels: dict[str, tk.Label] = {}
         self.marker_list_wraps: dict[str, tk.Frame] = {}
         self.marker_listboxes: dict[str, tk.Listbox] = {}
+        self.grid_buttons: dict[str, tk.Button] = {}
 
         top = tk.Frame(self.root)
         top.pack(pady=5, padx=10, fill="x")
@@ -531,8 +556,6 @@ class RandomSensorApp:
         render = tk.Frame(self.root)
         render.pack(pady=5, padx=10, fill="x")
         tk.Button(render, text="Render all", command=self._render_all).pack(side="left")
-        self.grid_button = tk.Button(render, text="Grid: On", command=self._toggle_grid)
-        self.grid_button.pack(side="left", padx=(12, 0))
         tk.Button(render, text="Save template…", command=self._save_graph_template).pack(
             side="left",
             padx=(12, 0),
@@ -569,7 +592,14 @@ class RandomSensorApp:
             return (5, 0)
         return (5, 5)
 
-    def _build_panel_column(self, parent: tk.Misc, p: ChartPanelConfig, padx: tuple[int, int]) -> None:
+    def _build_panel_column(
+        self,
+        parent: tk.Misc,
+        p: ChartPanelConfig,
+        padx: tuple[int, int],
+        *,
+        grid_on: bool,
+    ) -> None:
         pid = p["id"]
         frame = tk.LabelFrame(parent, text=p["panel_title"])
         frame.pack(side="left", fill="both", expand=True, padx=padx)
@@ -601,6 +631,13 @@ class RandomSensorApp:
             *CHART_TYPES,
             command=lambda _v, i=pid: self._on_chart_type_change(i),
         ).pack(side=tk.LEFT)
+        gb = tk.Button(
+            ctr,
+            text="Grid: On" if grid_on else "Grid: Off",
+            command=lambda i=pid: self._toggle_grid(i),
+        )
+        gb.pack(side=tk.LEFT, padx=(12, 0))
+        self.grid_buttons[pid] = gb
 
         plot_outer = tk.Frame(frame)
         plot_outer.pack(fill="both", expand=True)
@@ -689,7 +726,7 @@ class RandomSensorApp:
             new_ct = initial_chart_types(ordered)
             new_markers = {p["id"]: () for p in ordered}
             new_msi = {p["id"]: None for p in ordered}
-            grid = True
+            new_grid = {p["id"]: True for p in ordered}
         else:
             assert old is not None
             new_ds = {str(p["records_key"]): old.datasets.get(str(p["records_key"])) for p in ordered}
@@ -706,7 +743,7 @@ class RandomSensorApp:
                 else:
                     fb = old.chart_types.get(pid) or p.get("default_chart_type") or DEFAULT_CHART_TYPE
                     new_ct[pid] = normalize_chart_type(str(fb))
-            grid = old.grid_visible
+            new_grid = {p["id"]: old.grid_visible.get(p["id"], True) for p in ordered}
 
         for w in self.per_panel_render_frame.winfo_children():
             w.destroy()
@@ -732,6 +769,7 @@ class RandomSensorApp:
         self.marker_listboxes = {}
         self.panel_frames = {}
         self.graph_config_labels = {}
+        self.grid_buttons = {}
 
         half = SLIDER_TICKS // 2
         for p in self.panels:
@@ -755,7 +793,13 @@ class RandomSensorApp:
 
         n = len(self.panels)
         for i, p in enumerate(self.panels):
-            self._build_panel_column(self.charts_container, p, self._panel_column_padx(i, n))
+            pid = p["id"]
+            self._build_panel_column(
+                self.charts_container,
+                p,
+                self._panel_column_padx(i, n),
+                grid_on=new_grid[pid],
+            )
 
         self._set_state(
             SensorAppState(
@@ -763,10 +807,9 @@ class RandomSensorApp:
                 chart_types=new_ct,
                 markers=new_markers,
                 marker_selected_index=new_msi,
-                grid_visible=grid,
+                grid_visible=new_grid,
             ),
         )
-        self.grid_button.config(text="Grid: On" if grid else "Grid: Off")
         for p in self.panels:
             pid = p["id"]
             self._normalize_marker_selection(pid)
@@ -1024,11 +1067,13 @@ class RandomSensorApp:
         self._set_state(replace(self._state, chart_types=new_ct))
         self._render_panel(panel_id)
 
-    def _toggle_grid(self) -> None:
-        on = not self._state.grid_visible
-        self._set_state(replace(self._state, grid_visible=on))
-        self.grid_button.config(text="Grid: On" if on else "Grid: Off")
-        self._render_all()
+    def _toggle_grid(self, panel_id: str) -> None:
+        gv = dict(self._state.grid_visible)
+        on = not gv.get(panel_id, True)
+        gv[panel_id] = on
+        self._set_state(replace(self._state, grid_visible=gv))
+        self.grid_buttons[panel_id].config(text="Grid: On" if on else "Grid: Off")
+        self._render_panel(panel_id)
 
     def _save_graph_template(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1081,7 +1126,7 @@ class RandomSensorApp:
             records,
             normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE)),
             panel_figure_config(panel),
-            show_grid=self._state.grid_visible,
+            show_grid=self._state.grid_visible.get(panel_id, True),
             markers=marks,
             marker_selected_index=sel,
         )
