@@ -16,7 +16,21 @@ from matplotlib.figure import Figure
 
 CHART_TYPES = ["line", "bar", "scatter", "step", "stem"]
 DEFAULT_CHART_TYPE = "line"
-MARKER_STYLE_CHOICES = ("o", "s", "^", "v", "D", "P", "X", "*", "p", "h")
+MARKER_STYLE_ORDER: tuple[tuple[str, str], ...] = (
+    ("Circle", "o"),
+    ("Square", "s"),
+    ("Triangle up", "^"),
+    ("Triangle down", "v"),
+    ("Diamond", "D"),
+    ("Plus (filled)", "P"),
+    ("Cross (filled)", "X"),
+    ("Star", "*"),
+    ("Pentagon", "p"),
+    ("Hexagon", "h"),
+)
+MARKER_STYLE_DISPLAY_NAMES: tuple[str, ...] = tuple(n for n, _ in MARKER_STYLE_ORDER)
+MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
+MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
 
 
@@ -120,6 +134,7 @@ class ChartMarker:
     style: str
     x_frac: float
     y_value: float
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,7 +151,18 @@ def normalize_chart_type(value: str) -> str:
 
 
 def normalize_marker_style(value: str) -> str:
-    return value if value in MARKER_STYLE_CHOICES else MARKER_STYLE_CHOICES[0]
+    v = str(value).strip()
+    if v in MARKER_STYLE_CHAR_BY_DISPLAY:
+        return MARKER_STYLE_CHAR_BY_DISPLAY[v]
+    return v if v in MARKER_STYLE_CHOICES else MARKER_STYLE_CHOICES[0]
+
+
+def marker_style_display_name(char: str) -> str:
+    c = normalize_marker_style(char)
+    for name, ch in MARKER_STYLE_ORDER:
+        if ch == c:
+            return name
+    return MARKER_STYLE_DISPLAY_NAMES[0]
 
 
 def interpolate_x_coord(x_coords: list[object], frac: float) -> object:
@@ -195,12 +221,14 @@ def draw_seaborn_markers(
     markers: tuple[ChartMarker, ...],
     x_coords: list[object],
     selected_index: int | None,
-    selected_caption: str | None = None,
+    figure_config: ChartFigureConfig,
+    records: list[dict[str, object]] | None,
 ) -> None:
     if not markers:
         return
     palette = sns.color_palette("deep", max(len(markers), 3))
     ct = normalize_chart_type(chart_type)
+    xy_offsets = ((10, 10), (10, -26), (-10, 12), (-10, -26), (24, 4), (-24, -8), (8, 20), (-18, 20))
     for i, m in enumerate(markers):
         xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
         st = normalize_marker_style(m.style)
@@ -215,19 +243,27 @@ def draw_seaborn_markers(
             linewidths=3.6 if sel else 0.9,
             zorder=16 if sel else 15,
         )
-    if (
-        selected_caption
-        and selected_index is not None
-        and 0 <= selected_index < len(markers)
-    ):
-        m = markers[selected_index]
-        xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
+        parts: list[str] = []
+        if m.label.strip():
+            parts.append(m.label.strip())
+        rd = marker_readout_strings_figure(figure_config, records, m)
+        if rd:
+            xs_s, ys_s = rd
+            parts.extend((xs_s, ys_s))
+        else:
+            yu = figure_config.get("y_axis_unit")
+            parts.append(f"{m.x_frac:.0%}")
+            parts.append(
+                _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None),
+            )
+        caption = "\n".join(parts)
+        ox, oy = xy_offsets[i % len(xy_offsets)]
         ax.annotate(
-            selected_caption,
+            caption,
             (xv, m.y_value),
-            xytext=(10, 10),
+            xytext=(ox, oy),
             textcoords="offset points",
-            fontsize=8,
+            fontsize=7,
             bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
             zorder=20,
         )
@@ -362,18 +398,41 @@ def marker_readout_strings_figure(
     return xs_s, ys_s
 
 
+def marker_axis_readout_lines(
+    panel: ChartPanelConfig,
+    records: list[dict[str, object]] | None,
+    markers: tuple[ChartMarker, ...],
+) -> tuple[str, str]:
+    x_lines: list[str] = []
+    y_lines: list[str] = []
+    yu_raw = panel.get("y_axis_unit")
+    yu = yu_raw if yu_raw and str(yu_raw).strip() else None
+    for i, m in enumerate(markers):
+        pfx = f"{m.label.strip()}: " if m.label.strip() else f"#{i + 1}: "
+        rd = marker_readout_strings(panel, records, m)
+        if rd:
+            xs_s, ys_s = rd
+            x_lines.append(f"{pfx}{xs_s}")
+            y_lines.append(f"{pfx}{ys_s}")
+        else:
+            x_lines.append(f"{pfx}{m.x_frac:.0%}")
+            y_lines.append(_format_y_readout(m.y_value, yu))
+    return "\n".join(x_lines), "\n".join(y_lines)
+
+
 def format_marker_list_label(
     panel: ChartPanelConfig,
     records: list[dict[str, object]] | None,
     index: int,
     m: ChartMarker,
 ) -> str:
-    st = normalize_marker_style(m.style)
+    st = marker_style_display_name(m.style)
+    head = m.label.strip() if m.label.strip() else f"#{index + 1}"
     rd = marker_readout_strings(panel, records, m)
     if rd:
         xs, ys = rd
-        return f"#{index + 1}  {st}  {xs}  {ys}"
-    return f"#{index + 1}  {st}  x={m.x_frac:.0%}  y={m.y_value:.4g}"
+        return f"{head}  {st}  {xs}  {ys}"
+    return f"{head}  {st}  x={m.x_frac:.0%}  y={m.y_value:.4g}"
 
 
 def draw_series(ax, x, y, chart_type: str) -> None:
@@ -429,21 +488,14 @@ def render_chart_figure(
     ax = figure.add_subplot(111)
     draw_series(ax, x, y, chart_type)
     if markers:
-        caption = None
-        if (
-            marker_selected_index is not None
-            and 0 <= marker_selected_index < len(markers)
-        ):
-            tup = marker_readout_strings_figure(config, records, markers[marker_selected_index])
-            if tup:
-                caption = f"{tup[0]}\n{tup[1]}"
         draw_seaborn_markers(
             ax,
             chart_type=chart_type,
             markers=markers,
             x_coords=x,
             selected_index=marker_selected_index,
-            selected_caption=caption,
+            figure_config=config,
+            records=records,
         )
     ax.set_title(config["title"])
     xu: str | None = config.get("x_axis_unit")
@@ -545,6 +597,9 @@ class RandomSensorApp:
         self.marker_readout_x_labels: dict[str, tk.Label] = {}
         self.marker_list_wraps: dict[str, tk.Frame] = {}
         self.marker_listboxes: dict[str, tk.Listbox] = {}
+        self.marker_label_vars: dict[str, tk.StringVar] = {}
+        self.marker_label_entries: dict[str, tk.Entry] = {}
+        self._suppress_marker_label = False
         self.grid_buttons: dict[str, tk.Button] = {}
 
         top = tk.Frame(self.root)
@@ -621,7 +676,7 @@ class RandomSensorApp:
         tk.OptionMenu(
             ctr,
             self.marker_style_vars[pid],
-            *MARKER_STYLE_CHOICES,
+            *MARKER_STYLE_DISPLAY_NAMES,
         ).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(ctr, text="Add marker", command=lambda i=pid: self._add_marker(i)).pack(side=tk.LEFT)
         tk.Label(ctr, text="Chart:").pack(side=tk.LEFT, padx=(12, 4))
@@ -639,6 +694,15 @@ class RandomSensorApp:
         gb.pack(side=tk.LEFT, padx=(12, 0))
         self.grid_buttons[pid] = gb
 
+        ctr_name = tk.Frame(frame)
+        ctr_name.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(ctr_name, text="Marker name:").pack(side=tk.LEFT, padx=(0, 4))
+        ent = tk.Entry(ctr_name, textvariable=self.marker_label_vars[pid], width=32)
+        ent.pack(side=tk.LEFT)
+        ent.bind("<FocusOut>", lambda _e, i=pid: self._on_marker_label_commit(i))
+        ent.bind("<Return>", lambda _e, i=pid: self._on_marker_label_commit(i))
+        self.marker_label_entries[pid] = ent
+
         plot_outer = tk.Frame(frame)
         plot_outer.pack(fill="both", expand=True)
 
@@ -649,7 +713,7 @@ class RandomSensorApp:
         axis_col.pack(side="left", fill="y", padx=(0, 4))
         y_wrap = tk.Frame(axis_col)
         tk.Label(y_wrap, text="Y ↕︎").pack()
-        ry_lab = tk.Label(y_wrap, text="", font=("Helvetica", 8), wraplength=100, justify=tk.CENTER)
+        ry_lab = tk.Label(y_wrap, text="", font=("Helvetica", 8), wraplength=140, justify=tk.CENTER)
         ry_lab.pack()
         y_scale = tk.Scale(
             y_wrap,
@@ -673,7 +737,7 @@ class RandomSensorApp:
         lab.pack(fill="both", expand=True)
         x_wrap = tk.Frame(chart_col)
         tk.Label(x_wrap, text="X ← →", anchor="center", font=("Helvetica", 8)).pack(fill="x", pady=(2, 0))
-        rx_lab = tk.Label(x_wrap, text="", font=("Helvetica", 8), anchor="center")
+        rx_lab = tk.Label(x_wrap, text="", font=("Helvetica", 8), anchor="center", wraplength=280, justify=tk.CENTER)
         rx_lab.pack(fill="x")
         x_scale = tk.Scale(
             x_wrap,
@@ -767,6 +831,8 @@ class RandomSensorApp:
         self.marker_readout_x_labels = {}
         self.marker_list_wraps = {}
         self.marker_listboxes = {}
+        self.marker_label_vars = {}
+        self.marker_label_entries = {}
         self.panel_frames = {}
         self.graph_config_labels = {}
         self.grid_buttons = {}
@@ -779,7 +845,8 @@ class RandomSensorApp:
             v = tk.StringVar(self.root)
             v.set(new_ct[pid])
             self.chart_type_vars[pid] = v
-            self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_CHOICES[0])
+            self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_DISPLAY_NAMES[0])
+            self.marker_label_vars[pid] = tk.StringVar(master=self.root, value="")
             self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
             self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
 
@@ -929,69 +996,124 @@ class RandomSensorApp:
         cur = tuple(self._state.markers.get(panel_id, ()))
         has_markers = bool(cur)
         list_wrap = self.marker_list_wraps[panel_id]
-        if has_markers:
-            if not list_wrap.winfo_ismapped():
-                list_wrap.pack(side="left", fill="y", padx=(8, 0))
-        else:
-            if list_wrap.winfo_ismapped():
-                list_wrap.pack_forget()
-
-        sel_idx = self._state.marker_selected_index.get(panel_id)
-        show = bool(cur) and sel_idx is not None
         y_wrap = self.marker_y_slider_wraps[panel_id]
         x_wrap = self.marker_x_slider_wraps[panel_id]
-        if show:
-            if not y_wrap.winfo_ismapped():
-                y_wrap.pack(fill="y", expand=True)
-            if not x_wrap.winfo_ismapped():
-                x_wrap.pack(fill="x", pady=(2, 0))
-        else:
+        y_scale = self.marker_y_scales[panel_id]
+        x_scale = self.marker_x_scales[panel_id]
+        ry = self.marker_readout_y_labels[panel_id]
+        rx = self.marker_readout_x_labels[panel_id]
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        records = self._state.datasets.get(panel["records_key"])
+
+        if not has_markers:
+            if list_wrap.winfo_ismapped():
+                list_wrap.pack_forget()
             if y_wrap.winfo_ismapped():
                 y_wrap.pack_forget()
             if x_wrap.winfo_ismapped():
                 x_wrap.pack_forget()
-
-        st = tk.NORMAL if show else tk.DISABLED
-        self.marker_x_scales[panel_id].config(state=st)
-        self.marker_y_scales[panel_id].config(state=st)
-
-        ry = self.marker_readout_y_labels[panel_id]
-        rx = self.marker_readout_x_labels[panel_id]
-        if not show:
+            if y_scale.winfo_ismapped():
+                y_scale.pack_forget()
+            if x_scale.winfo_ismapped():
+                x_scale.pack_forget()
             ry.config(text="")
             rx.config(text="")
+            self._sync_marker_label_entry(panel_id)
             return
 
-        bounds = self._panel_y_bounds(panel_id)
-        idx = self._effective_marker_index(panel_id)
-        if idx is None or not bounds:
-            ry.config(text="")
-            rx.config(text="")
-            return
-        picked = cur[idx]
-        ymin, ymax = bounds
-        self._suppress_marker_slide = True
-        try:
-            self.marker_x_vars[panel_id].set(max(0, min(SLIDER_TICKS, round(picked.x_frac * SLIDER_TICKS))))
-            if ymax > ymin:
-                ty = round((picked.y_value - ymin) / (ymax - ymin) * SLIDER_TICKS)
-                self.marker_y_vars[panel_id].set(max(0, min(SLIDER_TICKS, ty)))
+        if not list_wrap.winfo_ismapped():
+            list_wrap.pack(side="left", fill="y", padx=(8, 0))
+        if not y_wrap.winfo_ismapped():
+            y_wrap.pack(fill="y", expand=True)
+        if not x_wrap.winfo_ismapped():
+            x_wrap.pack(fill="x", pady=(2, 0))
+
+        sel_idx = self._state.marker_selected_index.get(panel_id)
+        show_sliders = sel_idx is not None
+
+        if show_sliders:
+            if not y_scale.winfo_ismapped():
+                y_scale.pack(fill="y", expand=True)
+            if not x_scale.winfo_ismapped():
+                x_scale.pack(fill="x")
+            y_scale.config(state=tk.NORMAL)
+            x_scale.config(state=tk.NORMAL)
+            bounds = self._panel_y_bounds(panel_id)
+            idx = self._effective_marker_index(panel_id)
+            if idx is not None and bounds:
+                picked = cur[idx]
+                ymin, ymax = bounds
+                self._suppress_marker_slide = True
+                try:
+                    self.marker_x_vars[panel_id].set(max(0, min(SLIDER_TICKS, round(picked.x_frac * SLIDER_TICKS))))
+                    if ymax > ymin:
+                        ty = round((picked.y_value - ymin) / (ymax - ymin) * SLIDER_TICKS)
+                        self.marker_y_vars[panel_id].set(max(0, min(SLIDER_TICKS, ty)))
+                    else:
+                        self.marker_y_vars[panel_id].set(SLIDER_TICKS // 2)
+                finally:
+                    self._suppress_marker_slide = False
+
+                rd = marker_readout_strings(panel, records, picked)
+                if rd:
+                    xs, ys = rd
+                    ry.config(text=ys)
+                    rx.config(text=xs)
+                else:
+                    yu = panel.get("y_axis_unit")
+                    ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
+                    rx.config(text=f"{picked.x_frac:.0%}")
             else:
-                self.marker_y_vars[panel_id].set(SLIDER_TICKS // 2)
-        finally:
-            self._suppress_marker_slide = False
-
-        panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel["records_key"])
-        rd = marker_readout_strings(panel, records, picked)
-        if rd:
-            xs, ys = rd
-            ry.config(text=ys)
-            rx.config(text=xs)
+                lx, ly = marker_axis_readout_lines(panel, records, cur)
+                ry.config(text=ly)
+                rx.config(text=lx)
         else:
-            yu = panel.get("y_axis_unit")
-            ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
-            rx.config(text=f"{picked.x_frac:.0%}")
+            if y_scale.winfo_ismapped():
+                y_scale.pack_forget()
+            if x_scale.winfo_ismapped():
+                x_scale.pack_forget()
+            y_scale.config(state=tk.DISABLED)
+            x_scale.config(state=tk.DISABLED)
+            lx, ly = marker_axis_readout_lines(panel, records, cur)
+            ry.config(text=ly)
+            rx.config(text=lx)
+
+        self._sync_marker_label_entry(panel_id)
+
+    def _sync_marker_label_entry(self, panel_id: str) -> None:
+        ent = self.marker_label_entries[panel_id]
+        cur = tuple(self._state.markers.get(panel_id, ()))
+        idx = self._effective_marker_index(panel_id)
+        if not cur or idx is None:
+            self._suppress_marker_label = True
+            try:
+                self.marker_label_vars[panel_id].set("")
+            finally:
+                self._suppress_marker_label = False
+            ent.config(state=tk.DISABLED)
+            return
+        ent.config(state=tk.NORMAL)
+        self._suppress_marker_label = True
+        try:
+            self.marker_label_vars[panel_id].set(cur[idx].label)
+        finally:
+            self._suppress_marker_label = False
+
+    def _on_marker_label_commit(self, panel_id: str) -> None:
+        if self._suppress_marker_label:
+            return
+        idx = self._effective_marker_index(panel_id)
+        if idx is None:
+            return
+        cur = tuple(self._state.markers.get(panel_id, ()))
+        if idx < 0 or idx >= len(cur):
+            return
+        text = self.marker_label_vars[panel_id].get()
+        old = cur[idx]
+        if text == old.label:
+            return
+        self._replace_marker_at(panel_id, idx, replace(old, label=text))
+        self._render_panel(panel_id)
 
     def _add_marker(self, panel_id: str) -> None:
         bounds = self._panel_y_bounds(panel_id)
@@ -1000,8 +1122,13 @@ class RandomSensorApp:
         ymin, ymax = bounds
         style = normalize_marker_style(self.marker_style_vars[panel_id].get())
         y_mid = ymin + (ymax - ymin) * 0.5
-        nm = ChartMarker(style=style, x_frac=0.5, y_value=float(y_mid))
         prev = tuple(self._state.markers.get(panel_id, ()))
+        nm = ChartMarker(
+            style=style,
+            x_frac=0.5,
+            y_value=float(y_mid),
+            label=f"Marker {len(prev) + 1}",
+        )
         new_markers: dict[str, tuple[ChartMarker, ...]] = {**self._state.markers, panel_id: (*prev, nm)}
         msi = dict(self._state.marker_selected_index)
         msi[panel_id] = len(prev)
