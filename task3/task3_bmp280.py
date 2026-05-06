@@ -7,7 +7,7 @@ from pathlib import Path
 import smbus2
 
 I2C_BUS = 1
-I2C_ADDRESS = 0x77
+I2C_ADDRESS = 0x76
 CSV_PATH = Path(__file__).resolve().parent / "bmp280_readings.csv"
 INTERVAL_S = 10
 
