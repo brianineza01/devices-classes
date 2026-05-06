@@ -8,6 +8,7 @@ from typing import Iterable, NotRequired, TypedDict
 import numpy as np
 import seaborn as sns
 import tkinter as tk
+from tkinter import filedialog, messagebox
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
@@ -41,6 +42,20 @@ class ChartPanelConfig(TypedDict):
     x_axis_unit: NotRequired[str]
     y_axis_unit: NotRequired[str]
     default_chart_type: NotRequired[str]
+
+
+_PANEL_CONFIG_REQUIRED_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "panel_title",
+        "records_key",
+        "x_axis_value_key",
+        "y_axis_values_key",
+        "title",
+        "x_axis_label",
+        "y_axis_label",
+    }
+)
 
 
 CHART_PANELS: list[ChartPanelConfig] = json.loads(
@@ -229,6 +244,24 @@ def generate_pressure_records(n: int, rng: np.random.Generator) -> list[dict[str
                 "pressure_hpa": float(1013 + rng.standard_normal() * 5),
             }
         )
+    return json.loads(json.dumps(rows))
+
+
+def generate_generic_numeric_records(
+    n: int, rng: np.random.Generator, panel: ChartPanelConfig
+) -> list[dict[str, object]]:
+    start = datetime(2024, 1, 1, tzinfo=None)
+    xk = panel["x_axis_value_key"]
+    yk = panel["y_axis_values_key"]
+    rows: list[dict[str, object]] = []
+    for i in range(n):
+        row: dict[str, object] = {}
+        if xk == "time":
+            row[xk] = (start + timedelta(minutes=i)).isoformat()
+        else:
+            row[xk] = float(i)
+        row[yk] = float(50 + rng.standard_normal() * 5)
+        rows.append(row)
     return json.loads(json.dumps(rows))
 
 
@@ -430,6 +463,26 @@ def figure_to_tk_photo(figure: Figure, canvas: FigureCanvasAgg) -> tk.PhotoImage
     return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
 
 
+def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("configuration must be a non-empty JSON array")
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each panel must be a JSON object")
+        keys = frozenset(item.keys())
+        if not _PANEL_CONFIG_REQUIRED_KEYS <= keys:
+            missing = _PANEL_CONFIG_REQUIRED_KEYS - keys
+            raise ValueError(f"panel missing required keys: {sorted(missing)}")
+        pid = str(item["id"])
+        if pid in seen:
+            raise ValueError(f"duplicate panel id: {pid}")
+        seen.add(pid)
+        out.append(item)
+    return out
+
+
 def initial_chart_types(panels: list[ChartPanelConfig]) -> dict[str, str]:
     out: dict[str, str] = {}
     for p in panels:
@@ -440,31 +493,23 @@ def initial_chart_types(panels: list[ChartPanelConfig]) -> dict[str, str]:
 
 class RandomSensorApp:
     def __init__(self) -> None:
-        self.panels = CHART_PANELS
+        self.panels: list[ChartPanelConfig] = []
+        self.panel_frames: dict[str, tk.LabelFrame] = {}
+        self.graph_config_labels: dict[str, tk.Label] = {}
         self.root = tk.Tk()
         self.root.title("Random Temperature & Pressure")
         self.root.geometry("1200x800")
 
         self.figures: dict[str, Figure] = {}
         self.figure_canvases: dict[str, FigureCanvasAgg] = {}
-        self.chart_photos: dict[str, tk.PhotoImage | None] = {p["id"]: None for p in self.panels}
+        self.chart_photos: dict[str, tk.PhotoImage | None] = {}
         self.chart_labels: dict[str, tk.Label] = {}
         self.chart_type_vars: dict[str, tk.StringVar] = {}
-        for p in self.panels:
-            pid = p["id"]
-            self.figures[pid] = Figure(figsize=(5.5, 5), dpi=100)
-            self.figure_canvases[pid] = FigureCanvasAgg(self.figures[pid])
-            v = tk.StringVar(self.root)
-            v.set(initial_chart_types(self.panels)[pid])
-            self.chart_type_vars[pid] = v
 
         self.samples_var = tk.StringVar(value="60")
         self._suppress_marker_slide = False
         self._suppress_marker_list = False
 
-        empty_ds: dict[str, list[dict[str, object]] | None] = {p["records_key"]: None for p in self.panels}
-        initial_markers: dict[str, tuple[ChartMarker, ...]] = {p["id"]: () for p in self.panels}
-        initial_marker_sel: dict[str, int | None] = {p["id"]: None for p in self.panels}
         self.marker_style_vars: dict[str, tk.StringVar] = {}
         self.marker_x_vars: dict[str, tk.IntVar] = {}
         self.marker_y_vars: dict[str, tk.IntVar] = {}
@@ -476,155 +521,257 @@ class RandomSensorApp:
         self.marker_readout_x_labels: dict[str, tk.Label] = {}
         self.marker_list_wraps: dict[str, tk.Frame] = {}
         self.marker_listboxes: dict[str, tk.Listbox] = {}
-        half = SLIDER_TICKS // 2
-        for p in self.panels:
-            pid = p["id"]
-            self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_CHOICES[0])
-            self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
-            self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
-
-        self._state = SensorAppState(
-            datasets=empty_ds,
-            chart_types=initial_chart_types(self.panels),
-            markers=initial_markers,
-            marker_selected_index=initial_marker_sel,
-            grid_visible=True,
-        )
 
         top = tk.Frame(self.root)
         top.pack(pady=5, padx=10, fill="x")
         tk.Button(top, text="Generate data", command=self._generate_and_render).pack(side="left")
         tk.Label(top, text="Samples:").pack(side="left", padx=(12, 2))
         tk.Entry(top, textvariable=self.samples_var, width=8).pack(side="left")
-        for p in self.panels:
-            pid = p["id"]
-            tk.Label(top, text=f"Chart ({pid}):").pack(side="left", padx=(12, 2))
-            tk.OptionMenu(
-                top,
-                self.chart_type_vars[pid],
-                *CHART_TYPES,
-                command=lambda _v, i=pid: self._on_chart_type_change(i),
-            ).pack(side="left")
 
         render = tk.Frame(self.root)
         render.pack(pady=5, padx=10, fill="x")
         tk.Button(render, text="Render all", command=self._render_all).pack(side="left")
         self.grid_button = tk.Button(render, text="Grid: On", command=self._toggle_grid)
         self.grid_button.pack(side="left", padx=(12, 0))
+        tk.Button(render, text="Save template…", command=self._save_graph_template).pack(
+            side="left",
+            padx=(12, 0),
+        )
+        tk.Button(render, text="Load configuration…", command=self._load_graph_configuration).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        self.per_panel_render_frame = tk.Frame(render)
+        self.per_panel_render_frame.pack(side="left", fill="x", expand=True)
+        self.status_label = tk.Label(render, text="Generating random sensor data")
+        self.status_label.pack(pady=(8, 0), anchor="w")
+
+        self.charts_container = tk.Frame(self.root)
+        self.charts_container.pack(pady=5, padx=10, fill="both", expand=True)
+
+        self._apply_panels_list(json.loads(json.dumps(CHART_PANELS)), initial=True)
+        self._generate_and_render()
+
+    def _series_for_panel(self, n: int, rng: np.random.Generator, p: ChartPanelConfig) -> list[dict[str, object]]:
+        rk = str(p["records_key"])
+        if rk == "temperature":
+            return generate_temperature_records(n, rng)
+        if rk == "pressure":
+            return generate_pressure_records(n, rng)
+        return generate_generic_numeric_records(n, rng, p)
+
+    def _panel_column_padx(self, index: int, total: int) -> tuple[int, int]:
+        if total <= 1:
+            return (0, 0)
+        if index == 0:
+            return (0, 5)
+        if index == total - 1:
+            return (5, 0)
+        return (5, 5)
+
+    def _build_panel_column(self, parent: tk.Misc, p: ChartPanelConfig, padx: tuple[int, int]) -> None:
+        pid = p["id"]
+        frame = tk.LabelFrame(parent, text=p["panel_title"])
+        frame.pack(side="left", fill="both", expand=True, padx=padx)
+        self.panel_frames[pid] = frame
+        tk.Label(frame, text="Graph configuration", font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        cfg_lab = tk.Label(
+            frame,
+            text=chart_config_display_text(panel_figure_config(p)),
+            justify=tk.LEFT,
+            anchor="nw",
+            font=("TkFixedFont", 10),
+        )
+        cfg_lab.pack(fill="x", padx=4, pady=(0, 4))
+        self.graph_config_labels[pid] = cfg_lab
+
+        ctr = tk.Frame(frame)
+        ctr.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(ctr, text="Marker:").pack(side=tk.LEFT, padx=(0, 4))
+        tk.OptionMenu(
+            ctr,
+            self.marker_style_vars[pid],
+            *MARKER_STYLE_CHOICES,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(ctr, text="Add marker", command=lambda i=pid: self._add_marker(i)).pack(side=tk.LEFT)
+        tk.Label(ctr, text="Chart:").pack(side=tk.LEFT, padx=(12, 4))
+        tk.OptionMenu(
+            ctr,
+            self.chart_type_vars[pid],
+            *CHART_TYPES,
+            command=lambda _v, i=pid: self._on_chart_type_change(i),
+        ).pack(side=tk.LEFT)
+
+        plot_outer = tk.Frame(frame)
+        plot_outer.pack(fill="both", expand=True)
+
+        body = tk.Frame(plot_outer)
+        body.pack(fill="both", expand=True)
+
+        axis_col = tk.Frame(body)
+        axis_col.pack(side="left", fill="y", padx=(0, 4))
+        y_wrap = tk.Frame(axis_col)
+        tk.Label(y_wrap, text="Y ↕︎").pack()
+        ry_lab = tk.Label(y_wrap, text="", font=("Helvetica", 8), wraplength=100, justify=tk.CENTER)
+        ry_lab.pack()
+        y_scale = tk.Scale(
+            y_wrap,
+            variable=self.marker_y_vars[pid],
+            from_=SLIDER_TICKS,
+            to=0,
+            orient=tk.VERTICAL,
+            length=220,
+            resolution=1,
+            showvalue=0,
+            command=lambda _v, i=pid: self._on_marker_y_slide(i),
+        )
+        y_scale.pack(fill="y", expand=True)
+        self.marker_y_scales[pid] = y_scale
+        self.marker_readout_y_labels[pid] = ry_lab
+        self.marker_y_slider_wraps[pid] = y_wrap
+
+        chart_col = tk.Frame(body)
+        chart_col.pack(side="left", fill="both", expand=True)
+        lab = tk.Label(chart_col)
+        lab.pack(fill="both", expand=True)
+        x_wrap = tk.Frame(chart_col)
+        tk.Label(x_wrap, text="X ← →", anchor="center", font=("Helvetica", 8)).pack(fill="x", pady=(2, 0))
+        rx_lab = tk.Label(x_wrap, text="", font=("Helvetica", 8), anchor="center")
+        rx_lab.pack(fill="x")
+        x_scale = tk.Scale(
+            x_wrap,
+            variable=self.marker_x_vars[pid],
+            from_=0,
+            to=SLIDER_TICKS,
+            orient=tk.HORIZONTAL,
+            resolution=1,
+            showvalue=0,
+            command=lambda _v, i=pid: self._on_marker_x_slide(i),
+        )
+        x_scale.pack(fill="x")
+        self.marker_x_scales[pid] = x_scale
+        self.marker_readout_x_labels[pid] = rx_lab
+        self.marker_x_slider_wraps[pid] = x_wrap
+
+        markers_side = tk.Frame(body)
+        self.marker_list_wraps[pid] = markers_side
+        tk.Label(markers_side, text="Markers", font=("Helvetica", 9)).pack(anchor="nw")
+        lb_fr = tk.Frame(markers_side)
+        lb_fr.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(lb_fr)
+        lb = tk.Listbox(
+            lb_fr,
+            height=12,
+            width=36,
+            exportselection=False,
+            font=("TkFixedFont", 9),
+            yscrollcommand=sb.set,
+        )
+        sb.config(command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        lb.bind("<<ListboxSelect>>", lambda _e, i=pid: self._on_marker_list_select(i))
+        lb.bind("<ButtonRelease-1>", lambda e, i=pid: self._on_marker_list_release(i, e))
+        self.marker_listboxes[pid] = lb
+
+        self.chart_labels[pid] = lab
+
+    def _apply_panels_list(self, panel_dicts: list[dict[str, object]], *, initial: bool) -> None:
+        ordered = [json.loads(json.dumps(p)) for p in panel_dicts]
+        if not ordered:
+            messagebox.showerror("Configuration", "At least one panel is required.")
+            return
+        old: SensorAppState | None = None
+        if not initial:
+            old = self._state
+        if initial:
+            new_ds = {str(p["records_key"]): None for p in ordered}
+            new_ct = initial_chart_types(ordered)
+            new_markers = {p["id"]: () for p in ordered}
+            new_msi = {p["id"]: None for p in ordered}
+            grid = True
+        else:
+            assert old is not None
+            new_ds = {str(p["records_key"]): old.datasets.get(str(p["records_key"])) for p in ordered}
+            new_markers = {}
+            new_msi = {}
+            new_ct = {}
+            for p in ordered:
+                pid = p["id"]
+                new_markers[pid] = tuple(old.markers.get(pid, ()))
+                new_msi[pid] = old.marker_selected_index.get(pid)
+                raw_dct = p.get("default_chart_type")
+                if raw_dct is not None and str(raw_dct).strip():
+                    new_ct[pid] = normalize_chart_type(str(raw_dct))
+                else:
+                    fb = old.chart_types.get(pid) or p.get("default_chart_type") or DEFAULT_CHART_TYPE
+                    new_ct[pid] = normalize_chart_type(str(fb))
+            grid = old.grid_visible
+
+        for w in self.per_panel_render_frame.winfo_children():
+            w.destroy()
+        for w in self.charts_container.winfo_children():
+            w.destroy()
+
+        self.panels = ordered
+        self.figures = {}
+        self.figure_canvases = {}
+        self.chart_photos = {p["id"]: None for p in self.panels}
+        self.chart_labels = {}
+        self.chart_type_vars = {}
+        self.marker_style_vars = {}
+        self.marker_x_vars = {}
+        self.marker_y_vars = {}
+        self.marker_y_scales = {}
+        self.marker_x_scales = {}
+        self.marker_y_slider_wraps = {}
+        self.marker_x_slider_wraps = {}
+        self.marker_readout_y_labels = {}
+        self.marker_readout_x_labels = {}
+        self.marker_list_wraps = {}
+        self.marker_listboxes = {}
+        self.panel_frames = {}
+        self.graph_config_labels = {}
+
+        half = SLIDER_TICKS // 2
+        for p in self.panels:
+            pid = p["id"]
+            self.figures[pid] = Figure(figsize=(5.5, 5), dpi=100)
+            self.figure_canvases[pid] = FigureCanvasAgg(self.figures[pid])
+            v = tk.StringVar(self.root)
+            v.set(new_ct[pid])
+            self.chart_type_vars[pid] = v
+            self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_CHOICES[0])
+            self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
+            self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
+
         for p in self.panels:
             pid = p["id"]
             tk.Button(
-                render,
+                self.per_panel_render_frame,
                 text=f"Render {pid}",
                 command=lambda i=pid: self._render_panel(i),
             ).pack(side="left", padx=(8, 0))
-        self.status_label = tk.Label(render, text="Generating random sensor data")
-        self.status_label.pack(pady=(8, 0))
 
-        charts = tk.Frame(self.root)
-        charts.pack(pady=5, padx=10, fill="both", expand=True)
+        n = len(self.panels)
         for i, p in enumerate(self.panels):
-            pid = p["id"]
-            padx = (0, 5) if i == 0 else (5, 0)
-            frame = tk.LabelFrame(charts, text=p["panel_title"])
-            frame.pack(side="left", fill="both", expand=True, padx=padx)
-            tk.Label(frame, text="Graph configuration", font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
-            tk.Label(
-                frame,
-                text=chart_config_display_text(panel_figure_config(p)),
-                justify=tk.LEFT,
-                anchor="nw",
-                font=("TkFixedFont", 10),
-            ).pack(fill="x", padx=4, pady=(0, 4))
+            self._build_panel_column(self.charts_container, p, self._panel_column_padx(i, n))
 
-            ctr = tk.Frame(frame)
-            ctr.pack(fill="x", padx=4, pady=(0, 6))
-            tk.Label(ctr, text="Marker:").pack(side=tk.LEFT, padx=(0, 4))
-            tk.OptionMenu(
-                ctr,
-                self.marker_style_vars[pid],
-                *MARKER_STYLE_CHOICES,
-            ).pack(side=tk.LEFT, padx=(0, 6))
-            tk.Button(ctr, text="Add marker", command=lambda i=pid: self._add_marker(i)).pack(side=tk.LEFT)
-
-            plot_outer = tk.Frame(frame)
-            plot_outer.pack(fill="both", expand=True)
-
-            body = tk.Frame(plot_outer)
-            body.pack(fill="both", expand=True)
-
-            axis_col = tk.Frame(body)
-            axis_col.pack(side="left", fill="y", padx=(0, 4))
-            y_wrap = tk.Frame(axis_col)
-            tk.Label(y_wrap, text="Y ↕︎").pack()
-            ry_lab = tk.Label(y_wrap, text="", font=("Helvetica", 8), wraplength=100, justify=tk.CENTER)
-            ry_lab.pack()
-            y_scale = tk.Scale(
-                y_wrap,
-                variable=self.marker_y_vars[pid],
-                from_=SLIDER_TICKS,
-                to=0,
-                orient=tk.VERTICAL,
-                length=220,
-                resolution=1,
-                showvalue=0,
-                command=lambda _v, i=pid: self._on_marker_y_slide(i),
-            )
-            y_scale.pack(fill="y", expand=True)
-            self.marker_y_scales[pid] = y_scale
-            self.marker_readout_y_labels[pid] = ry_lab
-            self.marker_y_slider_wraps[pid] = y_wrap
-
-            chart_col = tk.Frame(body)
-            chart_col.pack(side="left", fill="both", expand=True)
-            lab = tk.Label(chart_col)
-            lab.pack(fill="both", expand=True)
-            x_wrap = tk.Frame(chart_col)
-            tk.Label(x_wrap, text="X ← →", anchor="center", font=("Helvetica", 8)).pack(fill="x", pady=(2, 0))
-            rx_lab = tk.Label(x_wrap, text="", font=("Helvetica", 8), anchor="center")
-            rx_lab.pack(fill="x")
-            x_scale = tk.Scale(
-                x_wrap,
-                variable=self.marker_x_vars[pid],
-                from_=0,
-                to=SLIDER_TICKS,
-                orient=tk.HORIZONTAL,
-                resolution=1,
-                showvalue=0,
-                command=lambda _v, i=pid: self._on_marker_x_slide(i),
-            )
-            x_scale.pack(fill="x")
-            self.marker_x_scales[pid] = x_scale
-            self.marker_readout_x_labels[pid] = rx_lab
-            self.marker_x_slider_wraps[pid] = x_wrap
-
-            markers_side = tk.Frame(body)
-            self.marker_list_wraps[pid] = markers_side
-            tk.Label(markers_side, text="Markers", font=("Helvetica", 9)).pack(anchor="nw")
-            lb_fr = tk.Frame(markers_side)
-            lb_fr.pack(fill="both", expand=True)
-            sb = tk.Scrollbar(lb_fr)
-            lb = tk.Listbox(
-                lb_fr,
-                height=12,
-                width=36,
-                exportselection=False,
-                font=("TkFixedFont", 9),
-                yscrollcommand=sb.set,
-            )
-            sb.config(command=lb.yview)
-            sb.pack(side="right", fill="y")
-            lb.pack(side="left", fill="both", expand=True)
-            lb.bind("<<ListboxSelect>>", lambda _e, i=pid: self._on_marker_list_select(i))
-            lb.bind("<ButtonRelease-1>", lambda e, i=pid: self._on_marker_list_release(i, e))
-            self.marker_listboxes[pid] = lb
-
-            self.chart_labels[pid] = lab
-
+        self._set_state(
+            SensorAppState(
+                datasets=new_ds,
+                chart_types=new_ct,
+                markers=new_markers,
+                marker_selected_index=new_msi,
+                grid_visible=grid,
+            ),
+        )
+        self.grid_button.config(text="Grid: On" if grid else "Grid: Off")
         for p in self.panels:
-            self._sync_marker_slider_ui(p["id"])
-
-        self._generate()
+            pid = p["id"]
+            self._normalize_marker_selection(pid)
+            self._sync_marker_slider_ui(pid)
+        self._render_all()
 
     def _set_state(self, state: SensorAppState) -> None:
         self._state = state
@@ -862,8 +1009,9 @@ class RandomSensorApp:
         n = parse_sample_count(self.samples_var.get())
         rng = np.random.default_rng()
         datasets = dict(self._state.datasets)
-        datasets["temperature"] = generate_temperature_records(n, rng)
-        datasets["pressure"] = generate_pressure_records(n, rng)
+        for p in self.panels:
+            k = str(p["records_key"])
+            datasets[k] = self._series_for_panel(n, rng, p)
         self._sync_chart_types_from_ui()
         self._set_state(replace(self._state, datasets=datasets))
         self.status_label.config(text=f"Generated {n} samples per series")
@@ -874,12 +1022,48 @@ class RandomSensorApp:
         new_ct[panel_id] = ct
         self.chart_type_vars[panel_id].set(ct)
         self._set_state(replace(self._state, chart_types=new_ct))
+        self._render_panel(panel_id)
 
     def _toggle_grid(self) -> None:
         on = not self._state.grid_visible
         self._set_state(replace(self._state, grid_visible=on))
         self.grid_button.config(text="Grid: On" if on else "Grid: Off")
         self._render_all()
+
+    def _save_graph_template(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.panels, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except OSError as e:
+            messagebox.showerror("Save template", str(e))
+
+    def _load_graph_configuration(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Load configuration", str(e))
+            return
+        try:
+            validated = validate_panel_config_json_list(raw)
+        except ValueError as e:
+            messagebox.showerror("Load configuration", str(e))
+            return
+        self._apply_panels_list(validated, initial=False)
 
     def _generate_and_render(self) -> None:
         self._generate()
@@ -895,7 +1079,7 @@ class RandomSensorApp:
         render_chart_figure(
             self.figures[panel_id],
             records,
-            self._state.chart_types[panel_id],
+            normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE)),
             panel_figure_config(panel),
             show_grid=self._state.grid_visible,
             markers=marks,
