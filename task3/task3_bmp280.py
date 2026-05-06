@@ -111,6 +111,16 @@ class BMP280:
         time.sleep(0.04)
 
 
+def bmp280_sample_row(sensor: BMP280) -> dict[str, object]:
+    ts = datetime.now(timezone.utc).isoformat()
+    temp_c, pressure_hpa = sensor.read_temperature_pressure()
+    return {
+        "time": ts,
+        "temperature_c": float(temp_c),
+        "pressure_hpa": float(pressure_hpa),
+    }
+
+
 class BMP280I2C(BMP280):
     def __init__(self) -> None:
         self._bus = smbus2.SMBus(I2C_BUS)

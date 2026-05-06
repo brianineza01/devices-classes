@@ -3,19 +3,22 @@ import csv
 import io
 import json
 import math
+import numbers
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
 
-import numpy as np
-import pandas as pd
-import seaborn as sns
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+import pandas as pd
+import seaborn as sns
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+
+from task3_bmp280 import BMP280I2C, bmp280_sample_row
 
 CHART_TYPES = ["line", "bar", "scatter", "step", "stem"]
 DEFAULT_CHART_TYPE = "line"
@@ -35,6 +38,8 @@ MARKER_STYLE_DISPLAY_NAMES: tuple[str, ...] = tuple(n for n, _ in MARKER_STYLE_O
 MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
 MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
+POLL_INTERVAL_MS = 3000
+DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
 
 
 class ChartFigureConfig(TypedDict):
@@ -60,6 +65,7 @@ class ChartPanelConfig(TypedDict):
     y_axis_unit: NotRequired[str]
     default_chart_type: NotRequired[str]
     data_csv_path: NotRequired[str]
+    data_source: NotRequired[str]
 
 
 _PANEL_CONFIG_REQUIRED_KEYS: frozenset[str] = frozenset(
@@ -83,6 +89,7 @@ CHART_PANELS: list[ChartPanelConfig] = json.loads(
                 "id": "p0",
                 "panel_title": "Temperature (°C)",
                 "records_key": "temperature",
+                "data_source": "sensor",
                 "x_axis_value_key": "time",
                 "y_axis_values_key": "temperature_c",
                 "title": "temperature_c",
@@ -94,6 +101,7 @@ CHART_PANELS: list[ChartPanelConfig] = json.loads(
                 "id": "p1",
                 "panel_title": "Pressure (hPa)",
                 "records_key": "pressure",
+                "data_source": "sensor",
                 "x_axis_value_key": "time",
                 "y_axis_values_key": "pressure_hpa",
                 "title": "pressure_hpa",
@@ -280,50 +288,18 @@ def parse_sample_count(text: str) -> int:
     return max(2, min(n, 10_000))
 
 
-def generate_temperature_records(n: int, rng: np.random.Generator) -> list[dict[str, object]]:
-    start = datetime(2024, 1, 1, tzinfo=None)
-    rows: list[dict[str, object]] = []
-    for i in range(n):
-        t = start + timedelta(minutes=i)
-        rows.append(
-            {
-                "time": t.isoformat(),
-                "temperature_c": float(20 + rng.standard_normal() * 3),
-            }
+def normalize_panel_data_source(panel: ChartPanelConfig) -> str:
+    raw = panel.get("data_source", "sensor")
+    s = str(raw).strip().lower()
+    if s not in DATA_SOURCE_CHOICES:
+        raise ValueError(
+            f"panel {panel.get('id', '?')}: data_source must be 'sensor' or 'file', not {raw!r}"
         )
-    return json.loads(json.dumps(rows))
+    return s
 
 
-def generate_pressure_records(n: int, rng: np.random.Generator) -> list[dict[str, object]]:
-    start = datetime(2024, 1, 1, tzinfo=None)
-    rows: list[dict[str, object]] = []
-    for i in range(n):
-        t = start + timedelta(minutes=i)
-        rows.append(
-            {
-                "time": t.isoformat(),
-                "pressure_hpa": float(1013 + rng.standard_normal() * 5),
-            }
-        )
-    return json.loads(json.dumps(rows))
-
-
-def generate_generic_numeric_records(
-    n: int, rng: np.random.Generator, panel: ChartPanelConfig
-) -> list[dict[str, object]]:
-    start = datetime(2024, 1, 1, tzinfo=None)
-    xk = panel["x_axis_value_key"]
-    yk = panel["y_axis_values_key"]
-    rows: list[dict[str, object]] = []
-    for i in range(n):
-        row: dict[str, object] = {}
-        if xk == "time":
-            row[xk] = (start + timedelta(minutes=i)).isoformat()
-        else:
-            row[xk] = float(i)
-        row[yk] = float(50 + rng.standard_normal() * 5)
-        rows.append(row)
-    return json.loads(json.dumps(rows))
+def panel_uses_sensor(panel: ChartPanelConfig) -> bool:
+    return normalize_panel_data_source(panel) == "sensor"
 
 
 def _parse_time_value(v: object) -> datetime:
@@ -557,6 +533,13 @@ def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
         if pid in seen:
             raise ValueError(f"duplicate panel id: {pid}")
         seen.add(pid)
+        ds_raw = item.get("data_source", "sensor")
+        ds_s = str(ds_raw).strip().lower()
+        if ds_s not in DATA_SOURCE_CHOICES:
+            raise ValueError(
+                f"panel {pid}: data_source must be 'sensor' or 'file', not {ds_raw!r}"
+            )
+        item["data_source"] = ds_s
         out.append(item)
     return out
 
@@ -628,8 +611,12 @@ def _csv_scalar(v: object) -> object:
         return t.isoformat()
     if isinstance(v, datetime):
         return v.isoformat()
-    if isinstance(v, (np.integer, np.floating)):
-        return v.item()
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    if isinstance(v, numbers.Real):
+        return float(v)
     if hasattr(v, "item") and not isinstance(v, (str, bytes)):
         try:
             return v.item()
@@ -662,14 +649,18 @@ def initial_chart_types(panels: list[ChartPanelConfig]) -> dict[str, str]:
     return out
 
 
-class RandomSensorApp:
+class SensorDashboardApp:
     def __init__(self) -> None:
+        self._sensor_rows: list[dict[str, object]] = []
+        self._bmp280: BMP280I2C | None = None
+        self._poll_after_id: str | None = None
         self.panels: list[ChartPanelConfig] = []
         self.panel_frames: dict[str, tk.LabelFrame] = {}
         self.graph_config_labels: dict[str, tk.Label] = {}
         self.root = tk.Tk()
-        self.root.title("Random Temperature & Pressure")
+        self.root.title("BMP280 charts (sensor / file)")
         self.root.geometry("1200x800")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
         self.figures: dict[str, Figure] = {}
         self.figure_canvases: dict[str, FigureCanvasAgg] = {}
@@ -697,12 +688,13 @@ class RandomSensorApp:
         self._suppress_marker_label = False
         self.grid_buttons: dict[str, tk.Button] = {}
         self.panel_csv_vars: dict[str, tk.StringVar] = {}
+        self.data_source_vars: dict[str, tk.StringVar] = {}
         self._template_dir: str | None = None
 
         top = tk.Frame(self.root)
         top.pack(pady=5, padx=10, fill="x")
-        tk.Button(top, text="Generate data", command=self._generate_and_render).pack(side="left")
-        tk.Label(top, text="Samples:").pack(side="left", padx=(12, 2))
+        tk.Button(top, text="Refresh data", command=self._refresh_datasets_and_render).pack(side="left")
+        tk.Label(top, text="Max sensor points:").pack(side="left", padx=(12, 2))
         tk.Entry(top, textvariable=self.samples_var, width=8).pack(side="left")
 
         render = tk.Frame(self.root)
@@ -722,22 +714,96 @@ class RandomSensorApp:
         )
         self.per_panel_render_frame = tk.Frame(render)
         self.per_panel_render_frame.pack(side="left", fill="x", expand=True)
-        self.status_label = tk.Label(render, text="Generating random sensor data")
+        self.status_label = tk.Label(render, text="Sensor idle — choose source per panel, then Refresh.")
         self.status_label.pack(pady=(8, 0), anchor="w")
 
         self.charts_container = tk.Frame(self.root)
         self.charts_container.pack(pady=5, padx=10, fill="both", expand=True)
 
         self._apply_panels_list(json.loads(json.dumps(CHART_PANELS)), initial=True)
-        self._generate_and_render()
 
-    def _series_for_panel(self, n: int, rng: np.random.Generator, p: ChartPanelConfig) -> list[dict[str, object]]:
-        rk = str(p["records_key"])
-        if rk == "temperature":
-            return generate_temperature_records(n, rng)
-        if rk == "pressure":
-            return generate_pressure_records(n, rng)
-        return generate_generic_numeric_records(n, rng, p)
+    def _any_sensor_panel(self) -> bool:
+        return any(panel_uses_sensor(p) for p in self.panels)
+
+    def _on_window_close(self) -> None:
+        self._cancel_poll()
+        if self._bmp280 is not None:
+            try:
+                self._bmp280.close()
+            finally:
+                self._bmp280 = None
+        self.root.destroy()
+
+    def _cancel_poll(self) -> None:
+        if self._poll_after_id is not None:
+            self.root.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
+
+    def _start_sensor_poll_if_needed(self) -> None:
+        self._cancel_poll()
+        if not self._any_sensor_panel():
+            if self._bmp280 is not None:
+                try:
+                    self._bmp280.close()
+                finally:
+                    self._bmp280 = None
+            return
+        if self._bmp280 is None:
+            try:
+                self._bmp280 = BMP280I2C()
+            except Exception as e:
+                messagebox.showerror("BMP280", str(e))
+                return
+        self._poll_after_id = self.root.after(0, self._poll_tick)
+
+    def _schedule_next_poll(self) -> None:
+        if self._bmp280 is None or not self._any_sensor_panel():
+            return
+        self._poll_after_id = self.root.after(POLL_INTERVAL_MS, self._poll_tick)
+
+    def _poll_tick(self) -> None:
+        self._poll_after_id = None
+        if self._bmp280 is None or not self._any_sensor_panel():
+            return
+        try:
+            row = bmp280_sample_row(self._bmp280)
+        except Exception as e:
+            self.status_label.config(text=f"Sensor read error: {e}")
+            self._schedule_next_poll()
+            return
+        self._sensor_rows.append(row)
+        lim = parse_sample_count(self.samples_var.get())
+        while len(self._sensor_rows) > lim:
+            self._sensor_rows.pop(0)
+        self._rebind_dataset_refs()
+        self._render_all()
+        self.status_label.config(text=status_for_state(self._state, self.panels))
+        self._schedule_next_poll()
+
+    def _rebind_dataset_refs(self) -> None:
+        ds_out: dict[str, list[dict[str, object]] | None] = {}
+        cur = dict(self._state.datasets)
+        for p in self.panels:
+            pid = p["id"]
+            prev = cur.get(pid)
+            if panel_uses_sensor(p):
+                ds_out[pid] = self._sensor_rows
+            else:
+                ds_out[pid] = [] if prev is self._sensor_rows else prev
+        self._set_state(replace(self._state, datasets=ds_out))
+
+    def _sync_panel_fields_from_ui(self) -> None:
+        for p in self.panels:
+            pid = p["id"]
+            p["data_csv_path"] = self.panel_csv_vars[pid].get()
+            src = self.data_source_vars[pid].get().strip().lower()
+            p["data_source"] = src if src in DATA_SOURCE_CHOICES else "sensor"
+
+    def _on_data_source_change(self, panel_id: str) -> None:
+        self._sync_panel_fields_from_ui()
+        self._rebind_dataset_refs()
+        self._start_sensor_poll_if_needed()
+        self._render_all()
 
     def _panel_column_padx(self, index: int, total: int) -> tuple[int, int]:
         if total <= 1:
@@ -770,6 +836,16 @@ class RandomSensorApp:
         )
         cfg_lab.pack(fill="x", padx=4, pady=(0, 4))
         self.graph_config_labels[pid] = cfg_lab
+
+        src_fr = tk.Frame(frame)
+        src_fr.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(src_fr, text="Data source:").pack(side="left", padx=(0, 4))
+        tk.OptionMenu(
+            src_fr,
+            self.data_source_vars[pid],
+            *DATA_SOURCE_CHOICES,
+            command=lambda _v, i=pid: self._on_data_source_change(i),
+        ).pack(side="left", fill="x", expand=True)
 
         csv_fr = tk.Frame(frame)
         csv_fr.pack(fill="x", padx=4, pady=(0, 6))
@@ -887,6 +963,8 @@ class RandomSensorApp:
         self, panel_dicts: list[dict[str, object]], *, initial: bool, render: bool = True
     ) -> None:
         ordered = [json.loads(json.dumps(p)) for p in panel_dicts]
+        for p in ordered:
+            p["data_source"] = normalize_panel_data_source(p)
         if not ordered:
             messagebox.showerror("Configuration", "At least one panel is required.")
             return
@@ -894,14 +972,26 @@ class RandomSensorApp:
         if not initial:
             old = self._state
         if initial:
-            new_ds = {p["id"]: None for p in ordered}
+            new_ds = {}
+            for p in ordered:
+                pid = p["id"]
+                new_ds[pid] = self._sensor_rows if panel_uses_sensor(p) else None
             new_ct = initial_chart_types(ordered)
             new_markers = {p["id"]: () for p in ordered}
             new_msi = {p["id"]: None for p in ordered}
             new_grid = {p["id"]: True for p in ordered}
         else:
             assert old is not None
-            new_ds = {p["id"]: old.datasets.get(p["id"]) for p in ordered}
+            new_ds = {}
+            for p in ordered:
+                pid = p["id"]
+                prev = old.datasets.get(pid)
+                if panel_uses_sensor(p):
+                    new_ds[pid] = self._sensor_rows
+                elif prev is self._sensor_rows:
+                    new_ds[pid] = None
+                else:
+                    new_ds[pid] = prev
             new_markers = {}
             new_msi = {}
             new_ct = {}
@@ -942,6 +1032,7 @@ class RandomSensorApp:
         self.marker_label_vars = {}
         self.marker_label_entries = {}
         self.panel_csv_vars = {}
+        self.data_source_vars = {}
         self.panel_frames = {}
         self.graph_config_labels = {}
         self.grid_buttons = {}
@@ -959,6 +1050,8 @@ class RandomSensorApp:
             self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
             self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
             self.panel_csv_vars[pid] = tk.StringVar(master=self.root, value=str(p.get("data_csv_path") or ""))
+            dsrc = tk.StringVar(master=self.root, value=str(p["data_source"]))
+            self.data_source_vars[pid] = dsrc
 
         for p in self.panels:
             pid = p["id"]
@@ -993,13 +1086,12 @@ class RandomSensorApp:
             self._sync_marker_slider_ui(pid)
         if render:
             self._render_all()
+        self._sync_panel_fields_from_ui()
+        if render:
+            self._start_sensor_poll_if_needed()
 
     def _set_state(self, state: SensorAppState) -> None:
         self._state = state
-
-    def _sync_panel_csv_from_ui(self) -> None:
-        for p in self.panels:
-            p["data_csv_path"] = self.panel_csv_vars[p["id"]].get()
 
     def _resolved_csv_path(self, rel: str) -> str:
         rel = rel.strip()
@@ -1316,17 +1408,21 @@ class RandomSensorApp:
             new_ct[pid] = ct
         self._set_state(replace(self._state, chart_types=new_ct))
 
-    def _generate(self) -> None:
-        self._sync_panel_csv_from_ui()
+    def _refresh_datasets(self) -> None:
+        self._sync_panel_fields_from_ui()
         self._sync_chart_types_from_ui()
-        rng = np.random.default_rng()
-        datasets = dict(self._state.datasets)
-        n = parse_sample_count(self.samples_var.get())
+        datasets: dict[str, list[dict[str, object]] | None] = {}
         summaries: list[str] = []
         for p in self.panels:
             pid = p["id"]
-            rel = str(p.get("data_csv_path") or "").strip()
-            if rel:
+            if panel_uses_sensor(p):
+                datasets[pid] = self._sensor_rows
+                summaries.append(f"{pid}: sensor({len(self._sensor_rows)})")
+            else:
+                rel = str(p.get("data_csv_path") or "").strip()
+                if not rel:
+                    messagebox.showerror("CSV", f"Panel {pid}: choose file source and set a CSV path, then Refresh.")
+                    return
                 fp = self._resolved_csv_path(rel)
                 try:
                     datasets[pid] = dataset_rows_from_wide_csv(fp, p)
@@ -1334,11 +1430,9 @@ class RandomSensorApp:
                     messagebox.showerror("CSV data", str(e))
                     return
                 summaries.append(f"{pid}: CSV({len(datasets[pid] or [])})")
-            else:
-                datasets[pid] = self._series_for_panel(n, rng, p)
-                summaries.append(f"{pid}: random({n})")
         self._set_state(replace(self._state, datasets=datasets))
         self.status_label.config(text=" · ".join(summaries))
+        self._start_sensor_poll_if_needed()
 
     def _on_chart_type_change(self, panel_id: str) -> None:
         ct = normalize_chart_type(self.chart_type_vars[panel_id].get())
@@ -1365,7 +1459,7 @@ class RandomSensorApp:
         if not path:
             return
         self._template_dir = os.path.dirname(os.path.abspath(path))
-        self._sync_panel_csv_from_ui()
+        self._sync_panel_fields_from_ui()
         try:
             payload = {"panels": json.loads(json.dumps(self.panels))}
             with open(path, "w", encoding="utf-8") as f:
@@ -1394,11 +1488,11 @@ class RandomSensorApp:
             messagebox.showerror("Load configuration", str(e))
             return
         self._apply_panels_list(validated, initial=False, render=False)
-        self._generate()
+        self._refresh_datasets()
         self._render_all()
 
-    def _generate_and_render(self) -> None:
-        self._generate()
+    def _refresh_datasets_and_render(self) -> None:
+        self._refresh_datasets()
         self._render_all()
 
     def _render_panel(self, panel_id: str) -> None:
@@ -1432,7 +1526,7 @@ class RandomSensorApp:
 
 
 def run() -> None:
-    app = RandomSensorApp()
+    app = SensorDashboardApp()
     app.root.mainloop()
 
 
