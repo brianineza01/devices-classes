@@ -1,12 +1,15 @@
 import base64
+import csv
 import io
 import json
 import math
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
 
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -34,7 +37,6 @@ MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
 
 
-
 class ChartFigureConfig(TypedDict):
     x_axis_value_key: str
     y_axis_values_key: str
@@ -57,6 +59,7 @@ class ChartPanelConfig(TypedDict):
     x_axis_unit: NotRequired[str]
     y_axis_unit: NotRequired[str]
     default_chart_type: NotRequired[str]
+    data_csv_path: NotRequired[str]
 
 
 _PANEL_CONFIG_REQUIRED_KEYS: frozenset[str] = frozenset(
@@ -522,8 +525,7 @@ def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> s
     parts: list[str] = []
     for p in panels:
         pid = p["id"]
-        key = p["records_key"]
-        rows = state.datasets.get(key)
+        rows = state.datasets.get(pid)
         n = len(rows) if rows else 0
         ct = normalize_chart_type(state.chart_types.get(pid, DEFAULT_CHART_TYPE))
         g = "on" if state.grid_visible.get(pid, True) else "off"
@@ -557,6 +559,99 @@ def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
         seen.add(pid)
         out.append(item)
     return out
+
+
+def parse_graph_template(raw: object) -> list[dict[str, object]]:
+    root_csv = ""
+    if isinstance(raw, list):
+        out = validate_panel_config_json_list(raw)
+    elif isinstance(raw, dict):
+        pr = raw.get("panels")
+        if not isinstance(pr, list):
+            raise ValueError("template object must include a non-empty 'panels' array")
+        rc = raw.get("data_csv_path")
+        if rc is not None and not isinstance(rc, str):
+            raise ValueError("template root data_csv_path must be a string")
+        root_csv = str(rc).strip() if rc else ""
+        out = validate_panel_config_json_list(pr)
+    else:
+        raise ValueError("configuration must be a JSON array or an object with 'panels'")
+    if root_csv:
+        for item in out:
+            if not str(item.get("data_csv_path") or "").strip():
+                item["data_csv_path"] = root_csv
+    return out
+
+
+def wide_rows_from_datasets(
+    datasets: dict[str, list[dict[str, object]] | None],
+) -> list[dict[str, object]]:
+    series_list = sorted((k, v) for k, v in datasets.items() if v)
+    if not series_list:
+        return []
+    max_len = max(len(v) for _, v in series_list)
+    rows: list[dict[str, object]] = []
+    for i in range(max_len):
+        merged: dict[str, object] = {}
+        for _rk, series in series_list:
+            if i < len(series):
+                for col, val in series[i].items():
+                    merged.setdefault(col, val)
+        rows.append(merged)
+    return rows
+
+
+def write_datasets_wide_csv(path: str, rows: list[dict[str, object]]) -> None:
+    keys: set[str] = set()
+    for r in rows:
+        keys.update(r.keys())
+    cols: list[str] = []
+    if "time" in keys:
+        cols.append("time")
+        keys.discard("time")
+    cols.extend(sorted(keys))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r.get(c, "") for c in cols})
+
+
+def _csv_scalar(v: object) -> object:
+    try:
+        if pd.isna(v):
+            raise ValueError("missing value in CSV")
+    except TypeError:
+        pass
+    if isinstance(v, pd.Timestamp):
+        t = v.to_pydatetime()
+        return t.isoformat()
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, (np.integer, np.floating)):
+        return v.item()
+    if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+        try:
+            return v.item()
+        except (ValueError, AttributeError):
+            pass
+    return v
+
+
+def dataset_rows_from_wide_csv(csv_path: str, panel: ChartPanelConfig) -> list[dict[str, object]]:
+    df = pd.read_csv(csv_path)
+    xk = str(panel["x_axis_value_key"])
+    yk = str(panel["y_axis_values_key"])
+    pid = str(panel["id"])
+    if xk not in df.columns or yk not in df.columns:
+        raise ValueError(
+            f"CSV {csv_path!r} missing columns for panel {pid}: "
+            f"need {xk!r} and {yk!r}; columns are {list(df.columns)}"
+        )
+    rows: list[dict[str, object]] = []
+    for _, row in df.iterrows():
+        rows.append({xk: _csv_scalar(row[xk]), yk: _csv_scalar(row[yk])})
+    return rows
 
 
 def initial_chart_types(panels: list[ChartPanelConfig]) -> dict[str, str]:
@@ -601,6 +696,8 @@ class RandomSensorApp:
         self.marker_label_entries: dict[str, tk.Entry] = {}
         self._suppress_marker_label = False
         self.grid_buttons: dict[str, tk.Button] = {}
+        self.panel_csv_vars: dict[str, tk.StringVar] = {}
+        self._template_dir: str | None = None
 
         top = tk.Frame(self.root)
         top.pack(pady=5, padx=10, fill="x")
@@ -616,6 +713,10 @@ class RandomSensorApp:
             padx=(12, 0),
         )
         tk.Button(render, text="Load configuration…", command=self._load_graph_configuration).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(render, text="Save data to CSV…", command=self._save_data_csv).pack(
             side="left",
             padx=(8, 0),
         )
@@ -669,6 +770,11 @@ class RandomSensorApp:
         )
         cfg_lab.pack(fill="x", padx=4, pady=(0, 4))
         self.graph_config_labels[pid] = cfg_lab
+
+        csv_fr = tk.Frame(frame)
+        csv_fr.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(csv_fr, text="Data CSV:").pack(side="left", padx=(0, 4))
+        tk.Entry(csv_fr, textvariable=self.panel_csv_vars[pid]).pack(side="left", fill="x", expand=True)
 
         ctr = tk.Frame(frame)
         ctr.pack(fill="x", padx=4, pady=(0, 6))
@@ -777,7 +883,9 @@ class RandomSensorApp:
 
         self.chart_labels[pid] = lab
 
-    def _apply_panels_list(self, panel_dicts: list[dict[str, object]], *, initial: bool) -> None:
+    def _apply_panels_list(
+        self, panel_dicts: list[dict[str, object]], *, initial: bool, render: bool = True
+    ) -> None:
         ordered = [json.loads(json.dumps(p)) for p in panel_dicts]
         if not ordered:
             messagebox.showerror("Configuration", "At least one panel is required.")
@@ -786,14 +894,14 @@ class RandomSensorApp:
         if not initial:
             old = self._state
         if initial:
-            new_ds = {str(p["records_key"]): None for p in ordered}
+            new_ds = {p["id"]: None for p in ordered}
             new_ct = initial_chart_types(ordered)
             new_markers = {p["id"]: () for p in ordered}
             new_msi = {p["id"]: None for p in ordered}
             new_grid = {p["id"]: True for p in ordered}
         else:
             assert old is not None
-            new_ds = {str(p["records_key"]): old.datasets.get(str(p["records_key"])) for p in ordered}
+            new_ds = {p["id"]: old.datasets.get(p["id"]) for p in ordered}
             new_markers = {}
             new_msi = {}
             new_ct = {}
@@ -833,6 +941,7 @@ class RandomSensorApp:
         self.marker_listboxes = {}
         self.marker_label_vars = {}
         self.marker_label_entries = {}
+        self.panel_csv_vars = {}
         self.panel_frames = {}
         self.graph_config_labels = {}
         self.grid_buttons = {}
@@ -849,6 +958,7 @@ class RandomSensorApp:
             self.marker_label_vars[pid] = tk.StringVar(master=self.root, value="")
             self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
             self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
+            self.panel_csv_vars[pid] = tk.StringVar(master=self.root, value=str(p.get("data_csv_path") or ""))
 
         for p in self.panels:
             pid = p["id"]
@@ -881,14 +991,45 @@ class RandomSensorApp:
             pid = p["id"]
             self._normalize_marker_selection(pid)
             self._sync_marker_slider_ui(pid)
-        self._render_all()
+        if render:
+            self._render_all()
 
     def _set_state(self, state: SensorAppState) -> None:
         self._state = state
 
+    def _sync_panel_csv_from_ui(self) -> None:
+        for p in self.panels:
+            p["data_csv_path"] = self.panel_csv_vars[p["id"]].get()
+
+    def _resolved_csv_path(self, rel: str) -> str:
+        rel = rel.strip()
+        if not rel:
+            return ""
+        if os.path.isabs(rel):
+            return os.path.normpath(rel)
+        base = self._template_dir if self._template_dir else os.getcwd()
+        return os.path.normpath(os.path.join(base, rel))
+
+    def _save_data_csv(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        rows = wide_rows_from_datasets(self._state.datasets)
+        if not rows:
+            messagebox.showwarning("Save data", "No data to export.")
+            return
+        try:
+            write_datasets_wide_csv(path, rows)
+        except OSError as e:
+            messagebox.showerror("Save data", str(e))
+
     def _panel_y_bounds(self, panel_id: str) -> tuple[float, float] | None:
         panel = next(p for p in self.panels if p["id"] == panel_id)
-        rows = self._state.datasets.get(panel["records_key"])
+        rows = self._state.datasets.get(panel_id)
         if not rows:
             return None
         yk = panel["y_axis_values_key"]
@@ -928,7 +1069,7 @@ class RandomSensorApp:
     def _refresh_marker_list(self, panel_id: str) -> None:
         lb = self.marker_listboxes[panel_id]
         panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel["records_key"])
+        records = self._state.datasets.get(panel_id)
         cur = tuple(self._state.markers.get(panel_id, ()))
         lb.delete(0, tk.END)
         for i, m in enumerate(cur):
@@ -1003,7 +1144,7 @@ class RandomSensorApp:
         ry = self.marker_readout_y_labels[panel_id]
         rx = self.marker_readout_x_labels[panel_id]
         panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel["records_key"])
+        records = self._state.datasets.get(panel_id)
 
         if not has_markers:
             if list_wrap.winfo_ismapped():
@@ -1176,15 +1317,28 @@ class RandomSensorApp:
         self._set_state(replace(self._state, chart_types=new_ct))
 
     def _generate(self) -> None:
-        n = parse_sample_count(self.samples_var.get())
+        self._sync_panel_csv_from_ui()
+        self._sync_chart_types_from_ui()
         rng = np.random.default_rng()
         datasets = dict(self._state.datasets)
+        n = parse_sample_count(self.samples_var.get())
+        summaries: list[str] = []
         for p in self.panels:
-            k = str(p["records_key"])
-            datasets[k] = self._series_for_panel(n, rng, p)
-        self._sync_chart_types_from_ui()
+            pid = p["id"]
+            rel = str(p.get("data_csv_path") or "").strip()
+            if rel:
+                fp = self._resolved_csv_path(rel)
+                try:
+                    datasets[pid] = dataset_rows_from_wide_csv(fp, p)
+                except (OSError, ValueError) as e:
+                    messagebox.showerror("CSV data", str(e))
+                    return
+                summaries.append(f"{pid}: CSV({len(datasets[pid] or [])})")
+            else:
+                datasets[pid] = self._series_for_panel(n, rng, p)
+                summaries.append(f"{pid}: random({n})")
         self._set_state(replace(self._state, datasets=datasets))
-        self.status_label.config(text=f"Generated {n} samples per series")
+        self.status_label.config(text=" · ".join(summaries))
 
     def _on_chart_type_change(self, panel_id: str) -> None:
         ct = normalize_chart_type(self.chart_type_vars[panel_id].get())
@@ -1210,9 +1364,12 @@ class RandomSensorApp:
         )
         if not path:
             return
+        self._template_dir = os.path.dirname(os.path.abspath(path))
+        self._sync_panel_csv_from_ui()
         try:
+            payload = {"panels": json.loads(json.dumps(self.panels))}
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.panels, f, indent=2, ensure_ascii=False)
+                json.dump(payload, f, indent=2, ensure_ascii=False)
                 f.write("\n")
         except OSError as e:
             messagebox.showerror("Save template", str(e))
@@ -1230,12 +1387,15 @@ class RandomSensorApp:
         except (OSError, json.JSONDecodeError) as e:
             messagebox.showerror("Load configuration", str(e))
             return
+        self._template_dir = os.path.dirname(os.path.abspath(path))
         try:
-            validated = validate_panel_config_json_list(raw)
+            validated = parse_graph_template(raw)
         except ValueError as e:
             messagebox.showerror("Load configuration", str(e))
             return
-        self._apply_panels_list(validated, initial=False)
+        self._apply_panels_list(validated, initial=False, render=False)
+        self._generate()
+        self._render_all()
 
     def _generate_and_render(self) -> None:
         self._generate()
@@ -1245,7 +1405,7 @@ class RandomSensorApp:
         self._sync_chart_types_from_ui()
         self._normalize_marker_selection(panel_id)
         panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel["records_key"])
+        records = self._state.datasets.get(panel_id)
         marks = self._state.markers.get(panel_id, ())
         sel = self._state.marker_selected_index.get(panel_id) if marks else None
         render_chart_figure(
