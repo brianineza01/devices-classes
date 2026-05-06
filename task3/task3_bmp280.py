@@ -104,6 +104,7 @@ class BMP280:
     def configuration(self, configuration: BMP280Configuration) -> None:
         self._configuration = configuration
         self._write(0xE0, b"\xb6")
+        time.sleep(0.002)
         self._write(0xF4, self._configuration.ctrl_meas)
         time.sleep(0.005)
         self._write(0xF5, self._configuration.config)
@@ -121,10 +122,13 @@ class BMP280I2C(BMP280):
         self._bus.close()
 
     def _write(self, register: int, txdata: bytes) -> None:
-        self._bus.write_i2c_block_data(self._address, register, list(txdata))
+        for offset, byte in enumerate(txdata):
+            self._bus.write_byte_data(self._address, register + offset, byte)
 
     def _read(self, register: int, nbytes: int) -> bytes:
-        return bytes(self._bus.read_i2c_block_data(self._address, register, nbytes))
+        return bytes(
+            self._bus.read_byte_data(self._address, register + i) for i in range(nbytes)
+        )
 
 
 def main() -> None:
