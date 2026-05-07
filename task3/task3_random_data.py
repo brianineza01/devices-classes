@@ -1141,6 +1141,7 @@ class SensorDashboardApp:
             if pid not in self.chart_labels:
                 continue
             self._sync_marker_slider_ui(pid)
+            self.root.after_idle(lambda i=pid: self._sync_marker_slider_geometry(i))
             self._refresh_marker_list(pid)
 
     def _schedule_render_async(self, panel_ids: frozenset[str] | None = None) -> None:
@@ -1361,7 +1362,6 @@ class SensorDashboardApp:
             from_=SLIDER_TICKS,
             to=0,
             orient=tk.VERTICAL,
-            length=220,
             resolution=1,
             showvalue=0,
             command=lambda _v, i=pid: self._on_marker_y_slide(i),
@@ -1393,6 +1393,7 @@ class SensorDashboardApp:
         self.marker_x_scales[pid] = x_scale
         self.marker_readout_x_labels[pid] = rx_lab
         self.marker_x_slider_wraps[pid] = x_wrap
+        lab.bind("<Configure>", lambda _e, i=pid: self._sync_marker_slider_geometry(i))
 
         markers_side = tk.Frame(body)
         self.marker_list_wraps[pid] = markers_side
@@ -1697,6 +1698,22 @@ class SensorDashboardApp:
             ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
             rx.config(text=f"{picked.x_frac:.0%}")
 
+    def _sync_marker_slider_geometry(self, panel_id: str) -> None:
+        lab = self.chart_labels.get(panel_id)
+        if lab is None:
+            return
+        w, h = lab.winfo_width(), lab.winfo_height()
+        x_sc = self.marker_x_scales.get(panel_id)
+        if x_sc is not None and w > 1:
+            x_target = max(100, w - 40)
+            if int(float(x_sc.cget("length"))) != x_target:
+                x_sc.config(length=x_target)
+        y_sc = self.marker_y_scales.get(panel_id)
+        if y_sc is not None and h > 1:
+            y_target = max(100, h - 40)
+            if int(float(y_sc.cget("length"))) != y_target:
+                y_sc.config(length=y_target)
+
     def _sync_marker_slider_ui(self, panel_id: str) -> None:
         cur = tuple(self._state.markers.get(panel_id, ()))
         has_markers = bool(cur)
@@ -1783,6 +1800,8 @@ class SensorDashboardApp:
             rx.config(text=lx)
 
         self._sync_marker_label_entry(panel_id)
+        if show_sliders:
+            self.root.after_idle(lambda i=panel_id: self._sync_marker_slider_geometry(i))
 
     def _sync_marker_label_entry(self, panel_id: str) -> None:
         ent = self.marker_label_entries[panel_id]
