@@ -39,6 +39,7 @@ MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
 MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
 POLL_INTERVAL_MS = 3000
+MAX_SENSOR_ROWS = 10_000
 DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
 
 
@@ -155,6 +156,7 @@ class SensorAppState:
     markers: dict[str, tuple[ChartMarker, ...]]
     marker_selected_index: dict[str, int | None]
     grid_visible: dict[str, bool]
+    config_json_visible: dict[str, bool]
 
 
 def normalize_chart_type(value: str) -> str:
@@ -278,14 +280,6 @@ def draw_seaborn_markers(
             bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
             zorder=20,
         )
-
-
-def parse_sample_count(text: str) -> int:
-    try:
-        n = int(text)
-    except ValueError:
-        n = 60
-    return max(2, min(n, 10_000))
 
 
 def normalize_panel_data_source(panel: ChartPanelConfig) -> str:
@@ -668,7 +662,6 @@ class SensorDashboardApp:
         self.chart_labels: dict[str, tk.Label] = {}
         self.chart_type_vars: dict[str, tk.StringVar] = {}
 
-        self.samples_var = tk.StringVar(value="60")
         self._suppress_marker_slide = False
         self._suppress_marker_list = False
 
@@ -685,36 +678,27 @@ class SensorDashboardApp:
         self.marker_listboxes: dict[str, tk.Listbox] = {}
         self.marker_label_vars: dict[str, tk.StringVar] = {}
         self.marker_label_entries: dict[str, tk.Entry] = {}
+        self.marker_label_frames: dict[str, tk.Frame] = {}
         self._suppress_marker_label = False
         self.grid_buttons: dict[str, tk.Button] = {}
-        self.panel_csv_vars: dict[str, tk.StringVar] = {}
-        self.data_source_vars: dict[str, tk.StringVar] = {}
+        self.config_json_buttons: dict[str, tk.Button] = {}
         self._template_dir: str | None = None
 
-        top = tk.Frame(self.root)
-        top.pack(pady=5, padx=10, fill="x")
-        tk.Button(top, text="Refresh data", command=self._refresh_datasets_and_render).pack(side="left")
-        tk.Label(top, text="Max sensor points:").pack(side="left", padx=(12, 2))
-        tk.Entry(top, textvariable=self.samples_var, width=8).pack(side="left")
-
-        render = tk.Frame(self.root)
-        render.pack(pady=5, padx=10, fill="x")
-        tk.Button(render, text="Render all", command=self._render_all).pack(side="left")
-        tk.Button(render, text="Save template…", command=self._save_graph_template).pack(
-            side="left",
-            padx=(12, 0),
-        )
-        tk.Button(render, text="Load configuration…", command=self._load_graph_configuration).pack(
+        toolbar = tk.Frame(self.root)
+        toolbar.pack(pady=5, padx=10, fill="x")
+        tk.Button(toolbar, text="Save template…", command=self._save_graph_template).pack(side="left")
+        tk.Button(toolbar, text="Load configuration…", command=self._load_graph_configuration).pack(
             side="left",
             padx=(8, 0),
         )
-        tk.Button(render, text="Save data to CSV…", command=self._save_data_csv).pack(
+        tk.Button(toolbar, text="Save data to CSV…", command=self._save_data_csv).pack(
             side="left",
             padx=(8, 0),
         )
-        self.per_panel_render_frame = tk.Frame(render)
-        self.per_panel_render_frame.pack(side="left", fill="x", expand=True)
-        self.status_label = tk.Label(render, text="Sensor idle — choose source per panel, then Refresh.")
+        self.status_label = tk.Label(
+            toolbar,
+            text="Data source and CSV paths come from the loaded JSON template; use Load configuration… to change them.",
+        )
         self.status_label.pack(pady=(8, 0), anchor="w")
 
         self.charts_container = tk.Frame(self.root)
@@ -772,7 +756,7 @@ class SensorDashboardApp:
             self._schedule_next_poll()
             return
         self._sensor_rows.append(row)
-        lim = parse_sample_count(self.samples_var.get())
+        lim = MAX_SENSOR_ROWS
         while len(self._sensor_rows) > lim:
             self._sensor_rows.pop(0)
         self._rebind_dataset_refs()
@@ -792,19 +776,6 @@ class SensorDashboardApp:
                 ds_out[pid] = [] if prev is self._sensor_rows else prev
         self._set_state(replace(self._state, datasets=ds_out))
 
-    def _sync_panel_fields_from_ui(self) -> None:
-        for p in self.panels:
-            pid = p["id"]
-            p["data_csv_path"] = self.panel_csv_vars[pid].get()
-            src = self.data_source_vars[pid].get().strip().lower()
-            p["data_source"] = src if src in DATA_SOURCE_CHOICES else "sensor"
-
-    def _on_data_source_change(self, panel_id: str) -> None:
-        self._sync_panel_fields_from_ui()
-        self._rebind_dataset_refs()
-        self._start_sensor_poll_if_needed()
-        self._render_all()
-
     def _panel_column_padx(self, index: int, total: int) -> tuple[int, int]:
         if total <= 1:
             return (0, 0)
@@ -821,12 +792,22 @@ class SensorDashboardApp:
         padx: tuple[int, int],
         *,
         grid_on: bool,
+        config_json_on: bool,
     ) -> None:
         pid = p["id"]
         frame = tk.LabelFrame(parent, text=p["panel_title"])
         frame.pack(side="left", fill="both", expand=True, padx=padx)
         self.panel_frames[pid] = frame
-        tk.Label(frame, text="Graph configuration", font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        hdr = tk.Frame(frame)
+        hdr.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Label(hdr, text="Graph configuration", font=("", 9, "bold")).pack(side="left")
+        jb = tk.Button(
+            hdr,
+            text="Hide JSON" if config_json_on else "Show JSON",
+            command=lambda i=pid: self._toggle_config_json(i),
+        )
+        jb.pack(side="right")
+        self.config_json_buttons[pid] = jb
         cfg_lab = tk.Label(
             frame,
             text=chart_config_display_text(panel_figure_config(p)),
@@ -834,42 +815,53 @@ class SensorDashboardApp:
             anchor="nw",
             font=("TkFixedFont", 10),
         )
-        cfg_lab.pack(fill="x", padx=4, pady=(0, 4))
         self.graph_config_labels[pid] = cfg_lab
+        if config_json_on:
+            cfg_lab.pack(fill="x", padx=4, pady=(0, 4))
 
+        dsrc = normalize_panel_data_source(p)
         src_fr = tk.Frame(frame)
         src_fr.pack(fill="x", padx=4, pady=(0, 6))
         tk.Label(src_fr, text="Data source:").pack(side="left", padx=(0, 4))
-        tk.OptionMenu(
-            src_fr,
-            self.data_source_vars[pid],
-            *DATA_SOURCE_CHOICES,
-            command=lambda _v, i=pid: self._on_data_source_change(i),
-        ).pack(side="left", fill="x", expand=True)
+        tk.Label(src_fr, text=dsrc, anchor="w").pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+        if dsrc == "file":
+            csv_fr = tk.Frame(frame)
+            csv_fr.pack(fill="x", padx=4, pady=(0, 6))
+            tk.Label(csv_fr, text="Data CSV:").pack(side="left", padx=(0, 4), anchor="nw")
+            rel = str(p.get("data_csv_path") or "").strip()
+            tk.Label(
+                csv_fr,
+                text=rel if rel else "—",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=480,
+            ).pack(side="left", fill="x", expand=True)
 
-        csv_fr = tk.Frame(frame)
-        csv_fr.pack(fill="x", padx=4, pady=(0, 6))
-        tk.Label(csv_fr, text="Data CSV:").pack(side="left", padx=(0, 4))
-        tk.Entry(csv_fr, textvariable=self.panel_csv_vars[pid]).pack(side="left", fill="x", expand=True)
-
-        ctr = tk.Frame(frame)
-        ctr.pack(fill="x", padx=4, pady=(0, 6))
-        tk.Label(ctr, text="Marker:").pack(side=tk.LEFT, padx=(0, 4))
+        ctr_marker = tk.Frame(frame)
+        ctr_marker.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(ctr_marker, text="Marker:").pack(side=tk.LEFT, padx=(0, 4))
         tk.OptionMenu(
-            ctr,
+            ctr_marker,
             self.marker_style_vars[pid],
             *MARKER_STYLE_DISPLAY_NAMES,
         ).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(ctr, text="Add marker", command=lambda i=pid: self._add_marker(i)).pack(side=tk.LEFT)
-        tk.Label(ctr, text="Chart:").pack(side=tk.LEFT, padx=(12, 4))
+        tk.Button(ctr_marker, text="Add marker", command=lambda i=pid: self._add_marker(i)).pack(side=tk.LEFT)
+
+        ctr_chart = tk.Frame(frame)
+        ctr_chart.pack(fill="x", padx=4, pady=(0, 6))
+        tk.Label(ctr_chart, text="Chart:").pack(side=tk.LEFT, padx=(0, 4))
         tk.OptionMenu(
-            ctr,
+            ctr_chart,
             self.chart_type_vars[pid],
             *CHART_TYPES,
             command=lambda _v, i=pid: self._on_chart_type_change(i),
         ).pack(side=tk.LEFT)
         gb = tk.Button(
-            ctr,
+            ctr_chart,
             text="Grid: On" if grid_on else "Grid: Off",
             command=lambda i=pid: self._toggle_grid(i),
         )
@@ -877,13 +869,13 @@ class SensorDashboardApp:
         self.grid_buttons[pid] = gb
 
         ctr_name = tk.Frame(frame)
-        ctr_name.pack(fill="x", padx=4, pady=(0, 6))
         tk.Label(ctr_name, text="Marker name:").pack(side=tk.LEFT, padx=(0, 4))
         ent = tk.Entry(ctr_name, textvariable=self.marker_label_vars[pid], width=32)
         ent.pack(side=tk.LEFT)
         ent.bind("<FocusOut>", lambda _e, i=pid: self._on_marker_label_commit(i))
         ent.bind("<Return>", lambda _e, i=pid: self._on_marker_label_commit(i))
         self.marker_label_entries[pid] = ent
+        self.marker_label_frames[pid] = ctr_name
 
         plot_outer = tk.Frame(frame)
         plot_outer.pack(fill="both", expand=True)
@@ -980,6 +972,7 @@ class SensorDashboardApp:
             new_markers = {p["id"]: () for p in ordered}
             new_msi = {p["id"]: None for p in ordered}
             new_grid = {p["id"]: True for p in ordered}
+            new_cfg_json = {p["id"]: False for p in ordered}
         else:
             assert old is not None
             new_ds = {}
@@ -1006,9 +999,8 @@ class SensorDashboardApp:
                     fb = old.chart_types.get(pid) or p.get("default_chart_type") or DEFAULT_CHART_TYPE
                     new_ct[pid] = normalize_chart_type(str(fb))
             new_grid = {p["id"]: old.grid_visible.get(p["id"], True) for p in ordered}
+            new_cfg_json = {p["id"]: old.config_json_visible.get(p["id"], False) for p in ordered}
 
-        for w in self.per_panel_render_frame.winfo_children():
-            w.destroy()
         for w in self.charts_container.winfo_children():
             w.destroy()
 
@@ -1031,11 +1023,11 @@ class SensorDashboardApp:
         self.marker_listboxes = {}
         self.marker_label_vars = {}
         self.marker_label_entries = {}
-        self.panel_csv_vars = {}
-        self.data_source_vars = {}
+        self.marker_label_frames = {}
         self.panel_frames = {}
         self.graph_config_labels = {}
         self.grid_buttons = {}
+        self.config_json_buttons = {}
 
         half = SLIDER_TICKS // 2
         for p in self.panels:
@@ -1049,17 +1041,6 @@ class SensorDashboardApp:
             self.marker_label_vars[pid] = tk.StringVar(master=self.root, value="")
             self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
             self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
-            self.panel_csv_vars[pid] = tk.StringVar(master=self.root, value=str(p.get("data_csv_path") or ""))
-            dsrc = tk.StringVar(master=self.root, value=str(p["data_source"]))
-            self.data_source_vars[pid] = dsrc
-
-        for p in self.panels:
-            pid = p["id"]
-            tk.Button(
-                self.per_panel_render_frame,
-                text=f"Render {pid}",
-                command=lambda i=pid: self._render_panel(i),
-            ).pack(side="left", padx=(8, 0))
 
         n = len(self.panels)
         for i, p in enumerate(self.panels):
@@ -1069,6 +1050,7 @@ class SensorDashboardApp:
                 p,
                 self._panel_column_padx(i, n),
                 grid_on=new_grid[pid],
+                config_json_on=new_cfg_json[pid],
             )
 
         self._set_state(
@@ -1078,6 +1060,7 @@ class SensorDashboardApp:
                 markers=new_markers,
                 marker_selected_index=new_msi,
                 grid_visible=new_grid,
+                config_json_visible=new_cfg_json,
             ),
         )
         for p in self.panels:
@@ -1086,7 +1069,6 @@ class SensorDashboardApp:
             self._sync_marker_slider_ui(pid)
         if render:
             self._render_all()
-        self._sync_panel_fields_from_ui()
         if render:
             self._start_sensor_poll_if_needed()
 
@@ -1315,9 +1297,12 @@ class SensorDashboardApp:
 
     def _sync_marker_label_entry(self, panel_id: str) -> None:
         ent = self.marker_label_entries[panel_id]
+        name_fr = self.marker_label_frames[panel_id]
         cur = tuple(self._state.markers.get(panel_id, ()))
         idx = self._effective_marker_index(panel_id)
         if not cur or idx is None:
+            if name_fr.winfo_ismapped():
+                name_fr.pack_forget()
             self._suppress_marker_label = True
             try:
                 self.marker_label_vars[panel_id].set("")
@@ -1325,6 +1310,8 @@ class SensorDashboardApp:
                 self._suppress_marker_label = False
             ent.config(state=tk.DISABLED)
             return
+        if not name_fr.winfo_ismapped():
+            name_fr.pack(fill="x", padx=4, pady=(0, 6))
         ent.config(state=tk.NORMAL)
         self._suppress_marker_label = True
         try:
@@ -1409,7 +1396,6 @@ class SensorDashboardApp:
         self._set_state(replace(self._state, chart_types=new_ct))
 
     def _refresh_datasets(self) -> None:
-        self._sync_panel_fields_from_ui()
         self._sync_chart_types_from_ui()
         datasets: dict[str, list[dict[str, object]] | None] = {}
         summaries: list[str] = []
@@ -1421,7 +1407,10 @@ class SensorDashboardApp:
             else:
                 rel = str(p.get("data_csv_path") or "").strip()
                 if not rel:
-                    messagebox.showerror("CSV", f"Panel {pid}: choose file source and set a CSV path, then Refresh.")
+                    messagebox.showerror(
+                        "CSV",
+                        f"Panel {pid}: set data_csv_path for file source in the JSON configuration and load it again.",
+                    )
                     return
                 fp = self._resolved_csv_path(rel)
                 try:
@@ -1450,6 +1439,18 @@ class SensorDashboardApp:
         self.grid_buttons[panel_id].config(text="Grid: On" if on else "Grid: Off")
         self._render_panel(panel_id)
 
+    def _toggle_config_json(self, panel_id: str) -> None:
+        cv = dict(self._state.config_json_visible)
+        on = not cv.get(panel_id, False)
+        cv[panel_id] = on
+        self._set_state(replace(self._state, config_json_visible=cv))
+        self.config_json_buttons[panel_id].config(text="Hide JSON" if on else "Show JSON")
+        lab = self.graph_config_labels[panel_id]
+        if on:
+            lab.pack(fill="x", padx=4, pady=(0, 4))
+        else:
+            lab.pack_forget()
+
     def _save_graph_template(self) -> None:
         path = filedialog.asksaveasfilename(
             parent=self.root,
@@ -1459,7 +1460,6 @@ class SensorDashboardApp:
         if not path:
             return
         self._template_dir = os.path.dirname(os.path.abspath(path))
-        self._sync_panel_fields_from_ui()
         try:
             payload = {"panels": json.loads(json.dumps(self.panels))}
             with open(path, "w", encoding="utf-8") as f:
@@ -1488,10 +1488,6 @@ class SensorDashboardApp:
             messagebox.showerror("Load configuration", str(e))
             return
         self._apply_panels_list(validated, initial=False, render=False)
-        self._refresh_datasets()
-        self._render_all()
-
-    def _refresh_datasets_and_render(self) -> None:
         self._refresh_datasets()
         self._render_all()
 
