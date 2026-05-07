@@ -946,6 +946,14 @@ class SensorDashboardApp:
     def _any_sensor_panel(self) -> bool:
         return any(panel_uses_sensor(p) for p in self.panels)
 
+    def _should_use_render_worker(self, panel_ids: frozenset[str]) -> bool:
+        if not self._sensor_poll_active:
+            return False
+        t = self._sensor_thread
+        if t is None or not t.is_alive():
+            return False
+        return any(panel_uses_sensor(p) for p in self.panels if p["id"] in panel_ids)
+
     def _on_window_close(self) -> None:
         self._stop_sensor_worker()
         self._shutdown_render_worker()
@@ -1108,7 +1116,17 @@ class SensorDashboardApp:
             self._normalize_marker_selection(pid)
         spec = self._build_render_spec(ids)
         self._render_generation += 1
-        self._maybe_submit_render_job((self._render_generation, spec))
+        generation = self._render_generation
+        if self._should_use_render_worker(ids):
+            self._maybe_submit_render_job((generation, spec))
+            return
+        try:
+            pngs = _render_specs_to_png(spec)
+        except Exception as e:
+            self.status_label.config(text=f"Chart render: {e}")
+            return
+        if generation == self._render_generation:
+            self._apply_render_pngs(pngs)
 
     def _stop_sensor_worker(self, join_timeout: float = 5.0) -> None:
         self._sensor_poll_active = False
@@ -1166,6 +1184,7 @@ class SensorDashboardApp:
             except queue.Empty:
                 break
         if not self._any_sensor_panel():
+            self._shutdown_render_worker()
             return
         self._sensor_poll_active = True
         self._sensor_thread = threading.Thread(
