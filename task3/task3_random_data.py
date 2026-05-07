@@ -1,8 +1,10 @@
 import base64
+import copy
 import csv
 import io
 import json
 import math
+import multiprocessing
 import numbers
 import os
 import queue
@@ -14,11 +16,18 @@ from typing import Iterable, NotRequired, TypedDict
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-import pandas as pd
-import seaborn as sns
+if os.environ.get("SENSOR_RENDER_WORKER") == "1":
+    import matplotlib as matplotlib_for_worker
+
+    matplotlib_for_worker.use("Agg", force=True)
+
 import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+
+import pandas as pd
+import seaborn as sns
 
 from task3_bmp280 import BMP280I2C, bmp280_sample_row
 
@@ -506,15 +515,6 @@ def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> s
     return " · ".join(parts)
 
 
-def figure_to_tk_photo(figure: Figure, canvas: FigureCanvasAgg) -> tk.PhotoImage:
-    canvas.draw()
-    buf = io.BytesIO()
-    figure.savefig(buf, format="png")
-    buf.seek(0)
-    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
-
-
-def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
     if not isinstance(raw, list) or not raw:
         raise ValueError("configuration must be a non-empty JSON array")
     out: list[dict[str, object]] = []
@@ -667,6 +667,72 @@ def _bmp280_poll_worker(stop: threading.Event, out_q: queue.Queue[tuple[str, obj
             sensor.close()
 
 
+CHART_RENDER_FIGSIZE = (5.5, 5)
+CHART_RENDER_DPI = 100
+CHART_RENDER_POLL_MS = 50
+
+
+def _render_specs_to_png(
+    specs: list[dict[str, object]],
+    *,
+    default_figsize: tuple[float, float] = CHART_RENDER_FIGSIZE,
+    default_dpi: int = CHART_RENDER_DPI,
+) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    for item in specs:
+        pid = str(item["id"])
+        fs_raw = item.get("figsize", default_figsize)
+        fs = (float(fs_raw[0]), float(fs_raw[1]))  # type: ignore[index]
+        dpi_i = int(item.get("dpi", default_dpi))
+        fig = Figure(figsize=fs, dpi=dpi_i)
+        canvas_agg = FigureCanvasAgg(fig)
+        cfg = _cast_figure_cfg(item["figure_config"])
+        render_chart_figure(
+            fig,
+            item["records"],  # type: ignore[arg-type]
+            normalize_chart_type(str(item["chart_type"])),
+            cfg,
+            show_grid=bool(item["show_grid"]),
+            markers=item["markers"],  # type: ignore[arg-type]
+            marker_selected_index=item.get("marker_selected_index"),
+        )
+        canvas_agg.draw()
+        bio = io.BytesIO()
+        fig.savefig(bio, format="png")
+        plt.close(fig)
+        out[pid] = bio.getvalue()
+    return out
+
+
+def _cast_figure_cfg(raw: object) -> ChartFigureConfig:
+    d = dict(raw)  # type: ignore[arg-type]
+    xs: ChartFigureConfig = {
+        "x_axis_value_key": str(d["x_axis_value_key"]),
+        "y_axis_values_key": str(d["y_axis_values_key"]),
+        "title": str(d["title"]),
+        "x_axis_label": str(d["x_axis_label"]),
+        "y_axis_label": str(d["y_axis_label"]),
+    }
+    if d.get("x_axis_unit"):
+        xs["x_axis_unit"] = str(d["x_axis_unit"])
+    if d.get("y_axis_unit"):
+        xs["y_axis_unit"] = str(d["y_axis_unit"])
+    return xs
+
+
+def _render_worker_main(cmd_q: object, result_q: object) -> None:
+    while True:
+        msg = cmd_q.get()
+        if msg is None:
+            break
+        generation, specs = msg
+        try:
+            pngs = _render_specs_to_png(specs)
+            result_q.put((generation, pngs, ""))
+        except Exception as e:
+            result_q.put((generation, None, str(e)))
+
+
 class SensorDashboardApp:
     def __init__(self) -> None:
         self._sensor_rows: list[dict[str, object]] = []
@@ -710,6 +776,14 @@ class SensorDashboardApp:
         self.grid_buttons: dict[str, tk.Button] = {}
         self.config_json_buttons: dict[str, tk.Button] = {}
         self._template_dir: str | None = None
+        self._render_mp_ctx = multiprocessing.get_context("spawn")
+        self._render_cmd_q: multiprocessing.Queue | None = None
+        self._render_result_q: multiprocessing.Queue | None = None
+        self._render_proc: multiprocessing.Process | None = None
+        self._render_generation = 0
+        self._render_busy = False
+        self._render_queued_job: tuple[int, list[dict[str, object]]] | None = None
+        self._render_poll_after_id: str | None = None
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -738,7 +812,167 @@ class SensorDashboardApp:
 
     def _on_window_close(self) -> None:
         self._stop_sensor_worker()
+        self._shutdown_render_worker()
         self.root.destroy()
+
+    def _shutdown_render_worker(self) -> None:
+        self._cancel_render_poll()
+        cq = self._render_cmd_q
+        if cq is not None:
+            try:
+                cq.put_nowait(None)
+            except Exception:
+                pass
+        proc = self._render_proc
+        self._render_proc = None
+        if proc is not None:
+            proc.join(timeout=4.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1.0)
+        self._render_busy = False
+        self._render_queued_job = None
+        rq = self._render_result_q
+        if rq is not None:
+            while True:
+                try:
+                    rq.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _cancel_render_poll(self) -> None:
+        if self._render_poll_after_id is not None:
+            self.root.after_cancel(self._render_poll_after_id)
+            self._render_poll_after_id = None
+
+    def _ensure_render_process(self) -> None:
+        if self._render_proc is not None and self._render_proc.is_alive():
+            return
+        self._render_proc = None
+        self._render_cmd_q = self._render_mp_ctx.Queue()
+        self._render_result_q = self._render_mp_ctx.Queue()
+        os.environ["SENSOR_RENDER_WORKER"] = "1"
+        try:
+            self._render_proc = self._render_mp_ctx.Process(
+                target=_render_worker_main,
+                args=(self._render_cmd_q, self._render_result_q),
+                daemon=True,
+                name="chart-render",
+            )
+            self._render_proc.start()
+        finally:
+            os.environ.pop("SENSOR_RENDER_WORKER", None)
+
+    def _build_render_spec(self, panel_ids: frozenset[str]) -> list[dict[str, object]]:
+        spec: list[dict[str, object]] = []
+        for p in self.panels:
+            pid = p["id"]
+            if pid not in panel_ids:
+                continue
+            marks = tuple(self._state.markers.get(pid, ()))
+            sel = self._state.marker_selected_index.get(pid) if marks else None
+            rec = self._state.datasets.get(pid)
+            spec.append(
+                {
+                    "id": pid,
+                    "figure_config": dict(panel_figure_config(p)),
+                    "chart_type": normalize_chart_type(
+                        self._state.chart_types.get(pid, DEFAULT_CHART_TYPE)
+                    ),
+                    "records": copy.deepcopy(rec) if rec is not None else None,
+                    "markers": copy.deepcopy(marks),
+                    "marker_selected_index": sel,
+                    "show_grid": self._state.grid_visible.get(pid, True),
+                    "figsize": CHART_RENDER_FIGSIZE,
+                    "dpi": CHART_RENDER_DPI,
+                }
+            )
+        return spec
+
+    def _maybe_submit_render_job(self, job: tuple[int, list[dict[str, object]]]) -> None:
+        if self._render_busy:
+            self._render_queued_job = job
+            return
+        self._ensure_render_process()
+        if self._render_cmd_q is None:
+            return
+        self._render_busy = True
+        try:
+            self._render_cmd_q.put(job)
+        except Exception as e:
+            self._render_busy = False
+            self.status_label.config(text=f"Chart render queue: {e}")
+            return
+        self._arm_render_poll()
+
+    def _arm_render_poll(self) -> None:
+        if self._render_poll_after_id is not None:
+            return
+        self._render_poll_after_id = self.root.after(CHART_RENDER_POLL_MS, self._poll_render_results)
+
+    def _poll_render_results(self) -> None:
+        self._render_poll_after_id = None
+        rq = self._render_result_q
+        proc = self._render_proc
+        if rq is None:
+            return
+        try:
+            generation, pngs, err_s = rq.get_nowait()
+        except queue.Empty:
+            if proc is not None and proc.is_alive():
+                self._arm_render_poll()
+            elif self._render_busy:
+                self._render_busy = False
+                self._render_proc = None
+                qj = self._render_queued_job
+                self._render_queued_job = None
+                if qj is not None:
+                    self._maybe_submit_render_job(qj)
+                else:
+                    self._maybe_submit_render_job(
+                        (
+                            self._render_generation,
+                            self._build_render_spec(frozenset(p["id"] for p in self.panels)),
+                        )
+                    )
+            return
+
+        self._render_busy = False
+
+        if err_s:
+            self.status_label.config(text=f"Chart render: {err_s}")
+        elif generation == self._render_generation and pngs is not None:
+            self._apply_render_pngs(pngs)
+
+        next_job = self._render_queued_job
+        self._render_queued_job = None
+        if next_job is not None:
+            self._maybe_submit_render_job(next_job)
+        elif generation != self._render_generation:
+            self._maybe_submit_render_job(
+                (
+                    self._render_generation,
+                    self._build_render_spec(frozenset(p["id"] for p in self.panels)),
+                )
+            )
+
+    def _apply_render_pngs(self, pngs: dict[str, bytes]) -> None:
+        for pid, data in pngs.items():
+            self.chart_photos[pid] = tk.PhotoImage(data=base64.b64encode(data))
+            self.chart_labels[pid].config(image=self.chart_photos[pid])
+        self.status_label.config(text=status_for_state(self._state, self.panels))
+        for pid in pngs:
+            self._sync_marker_slider_ui(pid)
+            self._refresh_marker_list(pid)
+
+    def _schedule_render_async(self, panel_ids: frozenset[str] | None = None) -> None:
+        self._sync_chart_types_from_ui()
+        ids = frozenset(p["id"] for p in self.panels) if panel_ids is None else frozenset(panel_ids)
+        for pid in ids:
+            self._normalize_marker_selection(pid)
+        spec = self._build_render_spec(ids)
+        self._render_generation += 1
+        self._maybe_submit_render_job((self._render_generation, spec))
 
     def _stop_sensor_worker(self, join_timeout: float = 5.0) -> None:
         self._sensor_poll_active = False
@@ -779,7 +1013,7 @@ class SensorDashboardApp:
         if got_row:
             self._rebind_dataset_refs()
             self._render_all()
-            self.status_label.config(text=status_for_state(self._state, self.panels))
+
         if (
             self._sensor_poll_active
             and self._any_sensor_panel()
@@ -1044,6 +1278,8 @@ class SensorDashboardApp:
             new_grid = {p["id"]: old.grid_visible.get(p["id"], True) for p in ordered}
             new_cfg_json = {p["id"]: old.config_json_visible.get(p["id"], False) for p in ordered}
 
+        for fig in list(self.figures.values()):
+            plt.close(fig)
         for w in self.charts_container.winfo_children():
             w.destroy()
 
@@ -1530,38 +1766,22 @@ class SensorDashboardApp:
         except ValueError as e:
             messagebox.showerror("Load configuration", str(e))
             return
-        self._apply_panels_list(validated, initial=False, render=False)
+        self._stop_sensor_worker()
+        while True:
+            try:
+                self._sensor_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._sensor_rows.clear()
+        self._apply_panels_list(validated, initial=True, render=False)
         self._refresh_datasets()
         self._render_all()
 
     def _render_panel(self, panel_id: str) -> None:
-        self._sync_chart_types_from_ui()
-        self._normalize_marker_selection(panel_id)
-        panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel_id)
-        marks = self._state.markers.get(panel_id, ())
-        sel = self._state.marker_selected_index.get(panel_id) if marks else None
-        render_chart_figure(
-            self.figures[panel_id],
-            records,
-            normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE)),
-            panel_figure_config(panel),
-            show_grid=self._state.grid_visible.get(panel_id, True),
-            markers=marks,
-            marker_selected_index=sel,
-        )
-        self.chart_photos[panel_id] = figure_to_tk_photo(
-            self.figures[panel_id], self.figure_canvases[panel_id]
-        )
-        self.chart_labels[panel_id].config(image=self.chart_photos[panel_id])
-        self.status_label.config(text=status_for_state(self._state, self.panels))
-        self._sync_marker_slider_ui(panel_id)
-        self._refresh_marker_list(panel_id)
+        self._schedule_render_async(frozenset({panel_id}))
 
     def _render_all(self) -> None:
-        self._sync_chart_types_from_ui()
-        for p in self.panels:
-            self._render_panel(p["id"])
+        self._schedule_render_async(None)
 
 
 def run() -> None:
