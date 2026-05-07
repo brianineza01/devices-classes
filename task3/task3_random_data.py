@@ -5,6 +5,8 @@ import json
 import math
 import numbers
 import os
+import queue
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
@@ -39,6 +41,7 @@ MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
 MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
 POLL_INTERVAL_MS = 3000
+SENSOR_UI_DRAIN_MS = 75
 MAX_SENSOR_ROWS = 10_000
 DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
 
@@ -643,11 +646,35 @@ def initial_chart_types(panels: list[ChartPanelConfig]) -> dict[str, str]:
     return out
 
 
+def _bmp280_poll_worker(stop: threading.Event, out_q: queue.Queue[tuple[str, object]]) -> None:
+    sensor: BMP280I2C | None = None
+    try:
+        try:
+            sensor = BMP280I2C()
+        except Exception as e:
+            out_q.put(("init_error", str(e)))
+            return
+        interval_s = POLL_INTERVAL_MS / 1000.0
+        while not stop.is_set():
+            try:
+                out_q.put(("row", bmp280_sample_row(sensor)))
+            except Exception as e:
+                out_q.put(("read_error", str(e)))
+            if stop.wait(timeout=interval_s):
+                break
+    finally:
+        if sensor is not None:
+            sensor.close()
+
+
 class SensorDashboardApp:
     def __init__(self) -> None:
         self._sensor_rows: list[dict[str, object]] = []
-        self._bmp280: BMP280I2C | None = None
-        self._poll_after_id: str | None = None
+        self._sensor_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._sensor_stop = threading.Event()
+        self._sensor_thread: threading.Thread | None = None
+        self._sensor_poll_active = False
+        self._sensor_ui_after_id: str | None = None
         self.panels: list[ChartPanelConfig] = []
         self.panel_frames: dict[str, tk.LabelFrame] = {}
         self.graph_config_labels: dict[str, tk.Label] = {}
@@ -710,59 +737,75 @@ class SensorDashboardApp:
         return any(panel_uses_sensor(p) for p in self.panels)
 
     def _on_window_close(self) -> None:
-        self._cancel_poll()
-        if self._bmp280 is not None:
-            try:
-                self._bmp280.close()
-            finally:
-                self._bmp280 = None
+        self._stop_sensor_worker()
         self.root.destroy()
 
-    def _cancel_poll(self) -> None:
-        if self._poll_after_id is not None:
-            self.root.after_cancel(self._poll_after_id)
-            self._poll_after_id = None
+    def _stop_sensor_worker(self, join_timeout: float = 5.0) -> None:
+        self._sensor_poll_active = False
+        self._sensor_stop.set()
+        if self._sensor_ui_after_id is not None:
+            self.root.after_cancel(self._sensor_ui_after_id)
+            self._sensor_ui_after_id = None
+        t = self._sensor_thread
+        self._sensor_thread = None
+        if t is not None:
+            t.join(timeout=join_timeout)
+        self._sensor_stop = threading.Event()
+
+    def _sensor_ui_drain(self) -> None:
+        self._sensor_ui_after_id = None
+        got_row = False
+        for _ in range(256):
+            try:
+                kind, payload = self._sensor_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "row":
+                assert isinstance(payload, dict)
+                self._sensor_rows.append(payload)
+                lim = MAX_SENSOR_ROWS
+                while len(self._sensor_rows) > lim:
+                    self._sensor_rows.pop(0)
+                got_row = True
+            elif kind == "init_error":
+                assert isinstance(payload, str)
+                self._sensor_poll_active = False
+                messagebox.showerror("BMP280", payload)
+                self._stop_sensor_worker(join_timeout=1.0)
+                return
+            elif kind == "read_error":
+                assert isinstance(payload, str)
+                self.status_label.config(text=f"Sensor read error: {payload}")
+        if got_row:
+            self._rebind_dataset_refs()
+            self._render_all()
+            self.status_label.config(text=status_for_state(self._state, self.panels))
+        if (
+            self._sensor_poll_active
+            and self._any_sensor_panel()
+            and self._sensor_thread is not None
+            and self._sensor_thread.is_alive()
+        ):
+            self._sensor_ui_after_id = self.root.after(SENSOR_UI_DRAIN_MS, self._sensor_ui_drain)
 
     def _start_sensor_poll_if_needed(self) -> None:
-        self._cancel_poll()
-        if not self._any_sensor_panel():
-            if self._bmp280 is not None:
-                try:
-                    self._bmp280.close()
-                finally:
-                    self._bmp280 = None
-            return
-        if self._bmp280 is None:
+        self._stop_sensor_worker()
+        while True:
             try:
-                self._bmp280 = BMP280I2C()
-            except Exception as e:
-                messagebox.showerror("BMP280", str(e))
-                return
-        self._poll_after_id = self.root.after(0, self._poll_tick)
-
-    def _schedule_next_poll(self) -> None:
-        if self._bmp280 is None or not self._any_sensor_panel():
+                self._sensor_queue.get_nowait()
+            except queue.Empty:
+                break
+        if not self._any_sensor_panel():
             return
-        self._poll_after_id = self.root.after(POLL_INTERVAL_MS, self._poll_tick)
-
-    def _poll_tick(self) -> None:
-        self._poll_after_id = None
-        if self._bmp280 is None or not self._any_sensor_panel():
-            return
-        try:
-            row = bmp280_sample_row(self._bmp280)
-        except Exception as e:
-            self.status_label.config(text=f"Sensor read error: {e}")
-            self._schedule_next_poll()
-            return
-        self._sensor_rows.append(row)
-        lim = MAX_SENSOR_ROWS
-        while len(self._sensor_rows) > lim:
-            self._sensor_rows.pop(0)
-        self._rebind_dataset_refs()
-        self._render_all()
-        self.status_label.config(text=status_for_state(self._state, self.panels))
-        self._schedule_next_poll()
+        self._sensor_poll_active = True
+        self._sensor_thread = threading.Thread(
+            target=_bmp280_poll_worker,
+            args=(self._sensor_stop, self._sensor_queue),
+            daemon=True,
+            name="bmp280-poller",
+        )
+        self._sensor_thread.start()
+        self._sensor_ui_after_id = self.root.after(SENSOR_UI_DRAIN_MS, self._sensor_ui_drain)
 
     def _rebind_dataset_refs(self) -> None:
         ds_out: dict[str, list[dict[str, object]] | None] = {}
