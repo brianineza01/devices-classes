@@ -1,5 +1,4 @@
 import base64
-import copy
 import csv
 import io
 import json
@@ -806,6 +805,7 @@ def _bmp280_poll_worker(stop: threading.Event, out_q: queue.Queue[tuple[str, obj
 CHART_RENDER_FIGSIZE = (5.5, 5)
 CHART_RENDER_DPI = 100
 CHART_RENDER_POLL_MS = 50
+MARKER_CHART_RENDER_DEBOUNCE_MS = 500
 
 
 def _render_specs_to_png(
@@ -920,6 +920,7 @@ class SensorDashboardApp:
         self._render_busy = False
         self._render_queued_job: tuple[int, list[dict[str, object]]] | None = None
         self._render_poll_after_id: str | None = None
+        self._marker_chart_render_after_ids: dict[str, str] = {}
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -955,6 +956,7 @@ class SensorDashboardApp:
         return any(panel_uses_sensor(p) for p in self.panels if p["id"] in panel_ids)
 
     def _on_window_close(self) -> None:
+        self._cancel_marker_chart_render_debounce()
         self._stop_sensor_worker()
         self._shutdown_render_worker()
         self.root.destroy()
@@ -988,6 +990,28 @@ class SensorDashboardApp:
         if self._render_poll_after_id is not None:
             self.root.after_cancel(self._render_poll_after_id)
             self._render_poll_after_id = None
+
+    def _cancel_marker_chart_render_debounce(self, panel_id: str | None = None) -> None:
+        if panel_id is None:
+            for aid in self._marker_chart_render_after_ids.values():
+                self.root.after_cancel(aid)
+            self._marker_chart_render_after_ids.clear()
+            return
+        aid = self._marker_chart_render_after_ids.pop(panel_id, None)
+        if aid is not None:
+            self.root.after_cancel(aid)
+
+    def _schedule_marker_chart_render_debounced(self, panel_id: str) -> None:
+        if (old := self._marker_chart_render_after_ids.pop(panel_id, None)) is not None:
+            self.root.after_cancel(old)
+
+        def flush() -> None:
+            self._marker_chart_render_after_ids.pop(panel_id, None)
+            self._schedule_render_async(frozenset({panel_id}))
+
+        self._marker_chart_render_after_ids[panel_id] = self.root.after(
+            MARKER_CHART_RENDER_DEBOUNCE_MS, flush
+        )
 
     def _ensure_render_process(self) -> None:
         if self._render_proc is not None and self._render_proc.is_alive():
@@ -1023,8 +1047,8 @@ class SensorDashboardApp:
                     "chart_type": normalize_chart_type(
                         self._state.chart_types.get(pid, DEFAULT_CHART_TYPE)
                     ),
-                    "records": copy.deepcopy(rec) if rec is not None else None,
-                    "markers": copy.deepcopy(marks),
+                    "records": rec,
+                    "markers": marks,
                     "marker_selected_index": sel,
                     "show_grid": self._state.grid_visible.get(pid, True),
                     "figsize": CHART_RENDER_FIGSIZE,
@@ -1641,6 +1665,27 @@ class SensorDashboardApp:
             self._suppress_marker_list = False
         self._render_panel(panel_id)
 
+    def _refresh_marker_slide_readouts(self, panel_id: str) -> None:
+        ry = self.marker_readout_y_labels[panel_id]
+        rx = self.marker_readout_x_labels[panel_id]
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        records = self._state.datasets.get(panel_id)
+        cur = tuple(self._state.markers.get(panel_id, ()))
+        idx = self._effective_marker_index(panel_id)
+        bounds = self._panel_y_bounds(panel_id)
+        if idx is None or not bounds:
+            return
+        picked = cur[idx]
+        rd = marker_readout_strings(panel, records, picked)
+        if rd:
+            xs, ys = rd
+            ry.config(text=ys)
+            rx.config(text=xs)
+        else:
+            yu = panel.get("y_axis_unit")
+            ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
+            rx.config(text=f"{picked.x_frac:.0%}")
+
     def _sync_marker_slider_ui(self, panel_id: str) -> None:
         cur = tuple(self._state.markers.get(panel_id, ()))
         has_markers = bool(cur)
@@ -1710,15 +1755,7 @@ class SensorDashboardApp:
                 finally:
                     self._suppress_marker_slide = False
 
-                rd = marker_readout_strings(panel, records, picked)
-                if rd:
-                    xs, ys = rd
-                    ry.config(text=ys)
-                    rx.config(text=xs)
-                else:
-                    yu = panel.get("y_axis_unit")
-                    ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
-                    rx.config(text=f"{picked.x_frac:.0%}")
+                self._refresh_marker_slide_readouts(panel_id)
             else:
                 lx, ly = marker_axis_readout_lines(panel, records, cur)
                 ry.config(text=ly)
@@ -1820,7 +1857,8 @@ class SensorDashboardApp:
         if rows_x:
             xf2, pin2 = marker_pin_frac_from_records(panel_cf, rows_x, float(xf))
         self._replace_marker_at(panel_id, idx, replace(old, x_frac=float(xf2), pinned_x=pin2))
-        self._render_panel(panel_id)
+        self._refresh_marker_slide_readouts(panel_id)
+        self._schedule_marker_chart_render_debounced(panel_id)
 
     def _on_marker_y_slide(self, panel_id: str) -> None:
         if self._suppress_marker_slide:
@@ -1837,7 +1875,8 @@ class SensorDashboardApp:
         y_new = ymin + (ymax - ymin) * (tick / SLIDER_TICKS)
         old = cur[idx]
         self._replace_marker_at(panel_id, idx, replace(old, y_value=float(y_new)))
-        self._render_panel(panel_id)
+        self._refresh_marker_slide_readouts(panel_id)
+        self._schedule_marker_chart_render_debounced(panel_id)
 
     def _sync_chart_types_from_ui(self) -> None:
         new_ct: dict[str, str] = {}
@@ -1952,9 +1991,11 @@ class SensorDashboardApp:
         self._render_all()
 
     def _render_panel(self, panel_id: str) -> None:
+        self._cancel_marker_chart_render_debounce(panel_id)
         self._schedule_render_async(frozenset({panel_id}))
 
     def _render_all(self) -> None:
+        self._cancel_marker_chart_render_debounce()
         self._schedule_render_async(None)
 
 
