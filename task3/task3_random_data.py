@@ -149,8 +149,8 @@ def panel_figure_config(panel: ChartPanelConfig) -> ChartFigureConfig:
     return cfg
 
 
-def chart_config_display_text(config: ChartFigureConfig) -> str:
-    return json.dumps(config, indent=2, sort_keys=True)
+def panel_config_display_text(panel: ChartPanelConfig) -> str:
+    return json.dumps(panel, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -650,6 +650,7 @@ def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> s
     return " · ".join(parts)
 
 
+def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
     if not isinstance(raw, list) or not raw:
         raise ValueError("configuration must be a non-empty JSON array")
     out: list[dict[str, object]] = []
@@ -1212,7 +1213,7 @@ class SensorDashboardApp:
         self.panel_frames[pid] = frame
         hdr = tk.Frame(frame)
         hdr.pack(fill="x", padx=4, pady=(4, 0))
-        tk.Label(hdr, text="Graph configuration", font=("", 9, "bold")).pack(side="left")
+        tk.Label(hdr, text="Panel configuration", font=("", 9, "bold")).pack(side="left")
         jb = tk.Button(
             hdr,
             text="Hide JSON" if config_json_on else "Show JSON",
@@ -1222,7 +1223,7 @@ class SensorDashboardApp:
         self.config_json_buttons[pid] = jb
         cfg_lab = tk.Label(
             frame,
-            text=chart_config_display_text(panel_figure_config(p)),
+            text=panel_config_display_text(p),
             justify=tk.LEFT,
             anchor="nw",
             font=("TkFixedFont", 10),
