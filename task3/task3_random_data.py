@@ -805,7 +805,7 @@ def _bmp280_poll_worker(stop: threading.Event, out_q: queue.Queue[tuple[str, obj
 CHART_RENDER_FIGSIZE = (5.5, 5)
 CHART_RENDER_DPI = 100
 CHART_RENDER_POLL_MS = 50
-MARKER_CHART_RENDER_DEBOUNCE_MS = 500
+MARKER_SLIDER_CHART_RENDER_DEBOUNCE_MS = 500
 
 
 def _render_specs_to_png(
@@ -920,7 +920,7 @@ class SensorDashboardApp:
         self._render_busy = False
         self._render_queued_job: tuple[int, list[dict[str, object]]] | None = None
         self._render_poll_after_id: str | None = None
-        self._marker_chart_render_after_ids: dict[str, str] = {}
+        self._marker_slider_render_after_ids: dict[str, str] = {}
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -956,7 +956,7 @@ class SensorDashboardApp:
         return any(panel_uses_sensor(p) for p in self.panels if p["id"] in panel_ids)
 
     def _on_window_close(self) -> None:
-        self._cancel_marker_chart_render_debounce()
+        self._cancel_all_marker_slider_render_timers()
         self._stop_sensor_worker()
         self._shutdown_render_worker()
         self.root.destroy()
@@ -991,26 +991,31 @@ class SensorDashboardApp:
             self.root.after_cancel(self._render_poll_after_id)
             self._render_poll_after_id = None
 
-    def _cancel_marker_chart_render_debounce(self, panel_id: str | None = None) -> None:
-        if panel_id is None:
-            for aid in self._marker_chart_render_after_ids.values():
-                self.root.after_cancel(aid)
-            self._marker_chart_render_after_ids.clear()
-            return
-        aid = self._marker_chart_render_after_ids.pop(panel_id, None)
+    def _cancel_marker_slider_render_timer(self, panel_id: str) -> None:
+        aid = self._marker_slider_render_after_ids.pop(panel_id, None)
         if aid is not None:
-            self.root.after_cancel(aid)
+            try:
+                self.root.after_cancel(aid)
+            except tk.TclError:
+                pass
+
+    def _cancel_all_marker_slider_render_timers(self) -> None:
+        for aid in list(self._marker_slider_render_after_ids.values()):
+            try:
+                self.root.after_cancel(aid)
+            except tk.TclError:
+                pass
+        self._marker_slider_render_after_ids.clear()
 
     def _schedule_marker_chart_render_debounced(self, panel_id: str) -> None:
-        if (old := self._marker_chart_render_after_ids.pop(panel_id, None)) is not None:
-            self.root.after_cancel(old)
+        self._cancel_marker_slider_render_timer(panel_id)
 
         def flush() -> None:
-            self._marker_chart_render_after_ids.pop(panel_id, None)
+            self._marker_slider_render_after_ids.pop(panel_id, None)
             self._schedule_render_async(frozenset({panel_id}))
 
-        self._marker_chart_render_after_ids[panel_id] = self.root.after(
-            MARKER_CHART_RENDER_DEBOUNCE_MS, flush
+        self._marker_slider_render_after_ids[panel_id] = self.root.after(
+            MARKER_SLIDER_CHART_RENDER_DEBOUNCE_MS, flush
         )
 
     def _ensure_render_process(self) -> None:
@@ -1126,10 +1131,15 @@ class SensorDashboardApp:
 
     def _apply_render_pngs(self, pngs: dict[str, bytes]) -> None:
         for pid, data in pngs.items():
+            lab = self.chart_labels.get(pid)
+            if lab is None:
+                continue
             self.chart_photos[pid] = tk.PhotoImage(data=base64.b64encode(data))
-            self.chart_labels[pid].config(image=self.chart_photos[pid])
+            lab.config(image=self.chart_photos[pid])
         self.status_label.config(text=status_for_state(self._state, self.panels))
         for pid in pngs:
+            if pid not in self.chart_labels:
+                continue
             self._sync_marker_slider_ui(pid)
             self._refresh_marker_list(pid)
 
@@ -1416,6 +1426,7 @@ class SensorDashboardApp:
         if not ordered:
             messagebox.showerror("Configuration", "At least one panel is required.")
             return
+        self._cancel_all_marker_slider_render_timers()
         old: SensorAppState | None = None
         if not initial:
             old = self._state
@@ -1980,6 +1991,7 @@ class SensorDashboardApp:
             messagebox.showerror("Load configuration", str(e))
             return
         self._stop_sensor_worker()
+        self._shutdown_render_worker()
         while True:
             try:
                 self._sensor_queue.get_nowait()
@@ -1991,11 +2003,9 @@ class SensorDashboardApp:
         self._render_all()
 
     def _render_panel(self, panel_id: str) -> None:
-        self._cancel_marker_chart_render_debounce(panel_id)
         self._schedule_render_async(frozenset({panel_id}))
 
     def _render_all(self) -> None:
-        self._cancel_marker_chart_render_debounce()
         self._schedule_render_async(None)
 
 
