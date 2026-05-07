@@ -159,6 +159,7 @@ class ChartMarker:
     x_frac: float
     y_value: float
     label: str = ""
+    pinned_x: object | None = None
 
 
 @dataclass(frozen=True)
@@ -253,9 +254,12 @@ def draw_seaborn_markers(
         return
     palette = sns.color_palette("deep", max(len(markers), 3))
     ct = normalize_chart_type(chart_type)
+    xk = figure_config["x_axis_value_key"]
     xy_offsets = ((10, 10), (10, -26), (-10, 12), (-10, -26), (24, 4), (-24, -8), (8, 20), (-18, 20))
+    plot_xs: list[object] = []
     for i, m in enumerate(markers):
-        xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
+        xv = resolve_marker_plot_x(ax, ct, x_coords, xk, m)
+        plot_xs.append(xv)
         st = normalize_marker_style(m.style)
         sel = selected_index is not None and i == selected_index
         ax.scatter(
@@ -292,6 +296,7 @@ def draw_seaborn_markers(
             bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
             zorder=20,
         )
+    _union_xlims_with_marker_xs(ax, plot_xs)
 
 
 def normalize_panel_data_source(panel: ChartPanelConfig) -> str:
@@ -321,6 +326,136 @@ def coerce_time_axis_x(xk: str, raw: list[object]) -> tuple[list[object], bool]:
     if xk != "time":
         return raw, False
     return [_parse_time_value(v) for v in raw], True
+
+
+def serialize_x_for_marker(xk: str, xi: object) -> object:
+    if xk == "time":
+        dt = xi if isinstance(xi, datetime) else _parse_time_value(xi)
+        return dt.isoformat()
+    if isinstance(xi, (int, float)) and not isinstance(xi, bool):
+        return float(xi)
+    return str(xi)
+
+
+def deserialize_x_for_marker(xk: str, stored: object) -> object:
+    if stored is None:
+        raise ValueError("pinned_x is None")
+    if xk == "time":
+        return _parse_time_value(stored)
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+        return float(stored)
+    if isinstance(stored, str):
+        try:
+            return float(stored)
+        except ValueError:
+            pass
+        return stored
+    raise TypeError(f"unsupported pinned_x type {type(stored).__name__}")
+
+
+def _normalize_marker_x_compare(xk: str, v: object) -> object:
+    if xk == "time":
+        return _parse_time_value(v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return v
+
+
+def marker_x_interp_for_readout(xk: str, x_coords: list[object], m: ChartMarker) -> object:
+    if m.pinned_x is not None:
+        try:
+            return deserialize_x_for_marker(xk, m.pinned_x)
+        except (TypeError, ValueError):
+            pass
+    return interpolate_x_coord(x_coords, m.x_frac)
+
+
+def frac_from_marker_pin(
+    xk: str,
+    x_coords: list[object],
+    m: ChartMarker,
+) -> float:
+    if m.pinned_x is None:
+        return max(0.0, min(1.0, m.x_frac))
+    try:
+        target = deserialize_x_for_marker(xk, m.pinned_x)
+    except (TypeError, ValueError):
+        return max(0.0, min(1.0, m.x_frac))
+    if not x_coords:
+        return m.x_frac
+    a = _normalize_marker_x_compare(xk, x_coords[0])
+    b = _normalize_marker_x_compare(xk, x_coords[-1])
+    tt = _normalize_marker_x_compare(xk, target)
+    if isinstance(a, datetime) and isinstance(b, datetime) and isinstance(tt, datetime):
+        span_sec = (b - a).total_seconds()
+        if span_sec <= 0:
+            return m.x_frac
+        off = (tt - a).total_seconds()
+        return max(0.0, min(1.0, off / span_sec))
+    try:
+        fa, fb, ft = float(a), float(b), float(tt)
+    except (TypeError, ValueError):
+        return m.x_frac
+    span = fb - fa
+    if span <= 0:
+        return m.x_frac
+    return max(0.0, min(1.0, (ft - fa) / span))
+
+
+def marker_pin_frac_from_records(panel: ChartPanelConfig, rows: list[dict[str, object]], xf: float) -> tuple[float, object | None]:
+    xk = panel["x_axis_value_key"]
+    xs_raw = [r[xk] for r in rows]
+    x_coords, _ = coerce_time_axis_x(xk, xs_raw)
+    if not x_coords:
+        return xf, None
+    xi = interpolate_x_coord(x_coords, xf)
+    return xf, serialize_x_for_marker(xk, xi)
+
+
+def _bar_patch_center(ax, i: int) -> float:
+    p = ax.patches[i]
+    return float(p.get_x() + p.get_width() / 2)
+
+
+def resolve_marker_plot_x(ax, chart_type: str, x_coords: list[object], xk: str, m: ChartMarker) -> object:
+    ct = normalize_chart_type(chart_type)
+    n = len(x_coords)
+    fallback = m.pinned_x is None
+    target: object | None = None
+    if not fallback:
+        try:
+            target = deserialize_x_for_marker(xk, m.pinned_x)
+        except (TypeError, ValueError):
+            fallback = True
+    if fallback:
+        return marker_axes_x(ax, ct, x_coords, m.x_frac)
+    assert target is not None
+    if ct == "bar" and n > 0:
+        patches = ax.patches
+        if len(patches) >= n:
+            tt = _normalize_marker_x_compare(xk, target)
+            for j, xc in enumerate(x_coords):
+                if _normalize_marker_x_compare(xk, xc) == tt:
+                    return _bar_patch_center(ax, j)
+        return marker_axes_x(ax, ct, x_coords, m.x_frac)
+    return target
+
+
+def _union_xlims_with_marker_xs(ax, xvals: list[object]) -> None:
+    if not xvals:
+        return
+    lo_x, hi_x = ax.get_xlim()
+    nmin = lo_x
+    nmax = hi_x
+    for xv in xvals:
+        if isinstance(xv, datetime):
+            v = float(mdates.date2num(xv))
+        else:
+            v = float(xv)
+        nmin = min(nmin, v)
+        nmax = max(nmax, v)
+    if nmin < lo_x - 1e-12 or nmax > hi_x + 1e-12:
+        ax.set_xlim(nmin, nmax)
 
 
 def _annotate_x_text(xi: object) -> str:
@@ -356,7 +491,7 @@ def marker_readout_strings(
     x, x_is_time = coerce_time_axis_x(xk, xs)
     if not x:
         return None
-    xi = interpolate_x_coord(x, m.x_frac)
+    xi = marker_x_interp_for_readout(xk, x, m)
     t0, t1 = x[0], x[-1]
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
@@ -376,7 +511,7 @@ def marker_readout_strings_figure(
     x, x_is_time = coerce_time_axis_x(xk, xs)
     if not x:
         return None
-    xi = interpolate_x_coord(x, m.x_frac)
+    xi = marker_x_interp_for_readout(xk, x, m)
     t0, t1 = x[0], x[-1]
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
@@ -1539,7 +1674,14 @@ class SensorDashboardApp:
                 ymin, ymax = bounds
                 self._suppress_marker_slide = True
                 try:
-                    self.marker_x_vars[panel_id].set(max(0, min(SLIDER_TICKS, round(picked.x_frac * SLIDER_TICKS))))
+                    xk_pf = panel["x_axis_value_key"]
+                    xf_ui = picked.x_frac
+                    if records:
+                        xs_pf = [r[xk_pf] for r in records]
+                        xc_pf, _ = coerce_time_axis_x(xk_pf, xs_pf)
+                        if xc_pf:
+                            xf_ui = frac_from_marker_pin(xk_pf, xc_pf, picked)
+                    self.marker_x_vars[panel_id].set(max(0, min(SLIDER_TICKS, round(xf_ui * SLIDER_TICKS))))
                     if ymax > ymin:
                         ty = round((picked.y_value - ymin) / (ymax - ymin) * SLIDER_TICKS)
                         self.marker_y_vars[panel_id].set(max(0, min(SLIDER_TICKS, ty)))
@@ -1622,11 +1764,17 @@ class SensorDashboardApp:
         style = normalize_marker_style(self.marker_style_vars[panel_id].get())
         y_mid = ymin + (ymax - ymin) * 0.5
         prev = tuple(self._state.markers.get(panel_id, ()))
+        records = list(self._state.datasets.get(panel_id) or ())
+        xf0, pin = 0.5, None
+        if records:
+            panel_cfg = next(p for p in self.panels if p["id"] == panel_id)
+            xf0, pin = marker_pin_frac_from_records(panel_cfg, records, 0.5)
         nm = ChartMarker(
             style=style,
-            x_frac=0.5,
+            x_frac=float(xf0),
             y_value=float(y_mid),
             label=f"Marker {len(prev) + 1}",
+            pinned_x=pin,
         )
         new_markers: dict[str, tuple[ChartMarker, ...]] = {**self._state.markers, panel_id: (*prev, nm)}
         msi = dict(self._state.marker_selected_index)
@@ -1645,7 +1793,13 @@ class SensorDashboardApp:
         cur = tuple(self._state.markers.get(panel_id, ()))
         xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
-        self._replace_marker_at(panel_id, idx, replace(old, x_frac=float(xf)))
+        panel_cf = next(p for p in self.panels if p["id"] == panel_id)
+        rows_x = list(self._state.datasets.get(panel_id) or ())
+        xf2: float = float(xf)
+        pin2: object | None = old.pinned_x
+        if rows_x:
+            xf2, pin2 = marker_pin_frac_from_records(panel_cf, rows_x, float(xf))
+        self._replace_marker_at(panel_id, idx, replace(old, x_frac=float(xf2), pinned_x=pin2))
         self._render_panel(panel_id)
 
     def _on_marker_y_slide(self, panel_id: str) -> None:
