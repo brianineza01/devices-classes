@@ -6,6 +6,7 @@ import math
 import numbers
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
@@ -45,15 +46,53 @@ DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
 
 _PERF = os.environ.get("TASK3_PERF") == "1"
 
+PERF_GROUP_RENDER = "render"
+PERF_GROUP_CSV = "csv"
+PERF_GROUP_CONFIG = "config"
+PERF_GROUP_UI = "ui"
+PERF_GROUP_POLL = "poll"
+PERF_GROUP_DATA = "data"
 
-def _perf(ms: float, phase: str, **kv: object) -> None:
+_PERF_DEPTH = 0
+
+
+def _perf_fmt_kv(**kv: object) -> str:
+    if not kv:
+        return ""
+    return "  " + " ".join(f"{k}={v!r}" for k, v in kv.items())
+
+
+def _perf_emit(group: str, marker: str, label: str, ms: float | None, **kv: object) -> None:
     if not _PERF:
         return
-    if kv:
-        bits = " ".join(f"{k}={v!r}" for k, v in kv.items())
-        print(f"[task3_perf] {phase}: {ms:.2f}ms {bits}", flush=True)
+    ind = "\t" * _PERF_DEPTH
+    ctx = _perf_fmt_kv(**kv)
+    head = f"[task3_perf][{group}]{ind}{marker} {label}"
+    if ms is not None:
+        print(f"{head}\t{ms:.2f}ms{ctx}", flush=True)
     else:
-        print(f"[task3_perf] {phase}: {ms:.2f}ms", flush=True)
+        print(f"{head}{ctx}", flush=True)
+
+
+def _perf(ms: float, group: str, label: str, **kv: object) -> None:
+    _perf_emit(group, "·", label, ms, **kv)
+
+
+@contextmanager
+def _perf_region(group: str, label: str, **ctx: object):
+    global _PERF_DEPTH
+    if not _PERF:
+        yield
+        return
+    _perf_emit(group, "▼", label, None, **ctx)
+    _PERF_DEPTH += 1
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        ms = (time.perf_counter() - t0) * 1000
+        _PERF_DEPTH -= 1
+        _perf_emit(group, "╰", f"{label} · Σ", ms, **ctx)
 
 
 class ChartFigureConfig(TypedDict):
@@ -421,36 +460,65 @@ def format_marker_list_label(
     return f"{head}  {st}  x={m.x_frac:.0%}  y={m.y_value:.4g}"
 
 
-def draw_series(ax, x, y, chart_type: str) -> None:
-    current = normalize_chart_type(chart_type)
-    y_seq = list(y)
-    if current == "line":
-        sns.lineplot(x=x, y=y_seq, ax=ax)
-        ax.scatter(x, y_seq, color="red", s=50, zorder=5)
-    elif current == "bar":
-        sns.barplot(x=x, y=y_seq, ax=ax)
-        for i, bar in enumerate(ax.patches):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height(),
-                f"{float(y_seq[i]):.2f}",
-                ha="center",
-                va="bottom",
-            )
-    elif current == "scatter":
-        sns.scatterplot(x=x, y=y_seq, ax=ax)
-        for xi, yi in zip(x, y_seq):
-            ax.annotate(
-                f"({_annotate_x_text(xi)}, {float(yi):.2f})",
-                (xi, yi),
-                xytext=(5, 5),
-                textcoords="offset points",
-            )
-    elif current == "step":
-        ax.step(x, y_seq, where="post")
-        ax.scatter(x, y_seq, color="red", s=50, zorder=5)
-    elif current == "stem":
-        ax.stem(x, y_seq)
+def draw_series(
+    ax,
+    x,
+    y,
+    chart_type: str,
+    *,
+    panel_id: str | None = None,
+) -> None:
+    pid = panel_id or "?"
+    ct = normalize_chart_type(chart_type)
+    with _perf_region(PERF_GROUP_RENDER, "draw_series", panel_id=pid, ct=ct):
+        t_y = time.perf_counter()
+        y_seq = list(y)
+        _perf((time.perf_counter() - t_y) * 1000, PERF_GROUP_RENDER, "materialize_y_list", n=len(y_seq))
+        if ct == "line":
+            t_lp = time.perf_counter()
+            sns.lineplot(x=x, y=y_seq, ax=ax)
+            _perf((time.perf_counter() - t_lp) * 1000, PERF_GROUP_RENDER, "sns.lineplot")
+            t_sc = time.perf_counter()
+            ax.scatter(x, y_seq, color="red", s=50, zorder=5)
+            _perf((time.perf_counter() - t_sc) * 1000, PERF_GROUP_RENDER, "ax.scatter_overlay")
+        elif ct == "bar":
+            t_bp = time.perf_counter()
+            sns.barplot(x=x, y=y_seq, ax=ax)
+            _perf((time.perf_counter() - t_bp) * 1000, PERF_GROUP_RENDER, "sns.barplot")
+            t_lb = time.perf_counter()
+            for i, bar in enumerate(ax.patches):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    f"{float(y_seq[i]):.2f}",
+                    ha="center",
+                    va="bottom",
+                )
+            _perf((time.perf_counter() - t_lb) * 1000, PERF_GROUP_RENDER, "bar_value_labels_loop", nbars=len(ax.patches))
+        elif ct == "scatter":
+            t_sp = time.perf_counter()
+            sns.scatterplot(x=x, y=y_seq, ax=ax)
+            _perf((time.perf_counter() - t_sp) * 1000, PERF_GROUP_RENDER, "sns.scatterplot")
+            t_an = time.perf_counter()
+            for xi, yi in zip(x, y_seq):
+                ax.annotate(
+                    f"({_annotate_x_text(xi)}, {float(yi):.2f})",
+                    (xi, yi),
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                )
+            _perf((time.perf_counter() - t_an) * 1000, PERF_GROUP_RENDER, "point_annotation_loop", n=len(y_seq))
+        elif ct == "step":
+            t_st = time.perf_counter()
+            ax.step(x, y_seq, where="post")
+            _perf((time.perf_counter() - t_st) * 1000, PERF_GROUP_RENDER, "ax.step")
+            t_sc2 = time.perf_counter()
+            ax.scatter(x, y_seq, color="red", s=50, zorder=5)
+            _perf((time.perf_counter() - t_sc2) * 1000, PERF_GROUP_RENDER, "ax.scatter_overlay")
+        elif ct == "stem":
+            t_stem = time.perf_counter()
+            ax.stem(x, y_seq)
+            _perf((time.perf_counter() - t_stem) * 1000, PERF_GROUP_RENDER, "ax.stem")
 
 
 def render_chart_figure(
@@ -465,80 +533,73 @@ def render_chart_figure(
     panel_id: str | None = None,
     chart_type_normalized: str | None = None,
 ) -> None:
-    tf = time.perf_counter()
-    t_clear = time.perf_counter()
-    figure.clear()
-    figure.subplots_adjust(bottom=0.24)
-    _perf((time.perf_counter() - t_clear) * 1000, "figure.clear_and_margin", panel_id=panel_id or "?")
-    if not records:
-        _perf((time.perf_counter() - tf) * 1000, "render_chart_figure.total(empty)", panel_id=panel_id or "?")
-        return
-    t_data = time.perf_counter()
-    xk = config["x_axis_value_key"]
-    yk = config["y_axis_values_key"]
-    x, x_is_time = coerce_time_axis_x(xk, [r[xk] for r in records])
-    y = [r[yk] for r in records]
-    _perf(
-        (time.perf_counter() - t_data) * 1000,
-        "chart.coerce_xy",
-        panel_id=panel_id or "?",
-        n=len(records),
-        x_is_time=x_is_time,
-    )
-    t_axes = time.perf_counter()
-    ax = figure.add_subplot(111)
-    _perf((time.perf_counter() - t_axes) * 1000, "chart.add_subplot", panel_id=panel_id or "?")
+    pid = panel_id or "?"
     ct_label = chart_type_normalized or normalize_chart_type(chart_type)
-    t_series = time.perf_counter()
-    draw_series(ax, x, y, chart_type)
-    _perf((time.perf_counter() - t_series) * 1000, "chart.draw_series", panel_id=panel_id or "?", ct=ct_label)
-    if markers:
-        t_markers = time.perf_counter()
-        draw_seaborn_markers(
-            ax,
-            chart_type=chart_type,
-            markers=markers,
-            x_coords=x,
-            selected_index=marker_selected_index,
-            figure_config=config,
-            records=records,
-        )
+    nrec = len(records) if records else 0
+    with _perf_region(PERF_GROUP_RENDER, "render_chart_figure", panel_id=pid, ct=ct_label, n=nrec):
+        t_clear = time.perf_counter()
+        figure.clear()
+        figure.subplots_adjust(bottom=0.24)
+        _perf((time.perf_counter() - t_clear) * 1000, PERF_GROUP_RENDER, "figure.clear_and_margin", panel_id=pid)
+        if not records:
+            return
+        t_data = time.perf_counter()
+        xk = config["x_axis_value_key"]
+        yk = config["y_axis_values_key"]
+        x, x_is_time = coerce_time_axis_x(xk, [r[xk] for r in records])
+        y = [r[yk] for r in records]
         _perf(
-            (time.perf_counter() - t_markers) * 1000,
-            "chart.draw_markers",
-            panel_id=panel_id or "?",
-            n=len(markers),
-            ct=ct_label,
+            (time.perf_counter() - t_data) * 1000,
+            PERF_GROUP_RENDER,
+            "coerce_xy",
+            panel_id=pid,
+            n=len(records),
+            x_is_time=x_is_time,
         )
-    t_style = time.perf_counter()
-    ax.set_title(config["title"])
-    xu: str | None = config.get("x_axis_unit")
-    yu: str | None = config.get("y_axis_unit")
-    ax.set_xlabel(format_axis_label(config["x_axis_label"], xu))
-    ax.set_ylabel(format_axis_label(config["y_axis_label"], yu))
-    if x_is_time and len(x) >= 2:
-        t_dt0, t_dt1 = x[0], x[-1]
-        if isinstance(t_dt0, datetime) and isinstance(t_dt1, datetime):
-            span = t_dt1 - t_dt0
-            fmt = "%H:%M:%S" if span.days == 0 else "%Y-%m-%d %H:%M:%S"
-            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
-    ax.tick_params(axis="x", rotation=40, labelsize=9)
-    for lb in ax.get_xticklabels():
-        lb.set_horizontalalignment("right")
-    if show_grid:
-        ax.grid(True, linestyle="--", alpha=0.4)
-    else:
-        ax.grid(False)
-    _perf((time.perf_counter() - t_style) * 1000, "chart.labels_ticks_grid", panel_id=panel_id or "?")
-    _perf(
-        (time.perf_counter() - tf) * 1000,
-        "render_chart_figure.total",
-        panel_id=panel_id or "?",
-        n=len(records),
-        ct=ct_label,
-        markers=len(markers),
-    )
+        t_axes = time.perf_counter()
+        ax = figure.add_subplot(111)
+        _perf((time.perf_counter() - t_axes) * 1000, PERF_GROUP_RENDER, "figure.add_subplot", panel_id=pid)
+        draw_series(ax, x, y, chart_type, panel_id=pid)
+        if markers:
+            t_markers = time.perf_counter()
+            draw_seaborn_markers(
+                ax,
+                chart_type=chart_type,
+                markers=markers,
+                x_coords=x,
+                selected_index=marker_selected_index,
+                figure_config=config,
+                records=records,
+            )
+            _perf(
+                (time.perf_counter() - t_markers) * 1000,
+                PERF_GROUP_RENDER,
+                "draw_seaborn_markers",
+                panel_id=pid,
+                n_markers=len(markers),
+                ct=ct_label,
+            )
+        t_style = time.perf_counter()
+        ax.set_title(config["title"])
+        xu: str | None = config.get("x_axis_unit")
+        yu: str | None = config.get("y_axis_unit")
+        ax.set_xlabel(format_axis_label(config["x_axis_label"], xu))
+        ax.set_ylabel(format_axis_label(config["y_axis_label"], yu))
+        if x_is_time and len(x) >= 2:
+            t_dt0, t_dt1 = x[0], x[-1]
+            if isinstance(t_dt0, datetime) and isinstance(t_dt1, datetime):
+                span = t_dt1 - t_dt0
+                fmt = "%H:%M:%S" if span.days == 0 else "%Y-%m-%d %H:%M:%S"
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+        ax.tick_params(axis="x", rotation=40, labelsize=9)
+        for lb in ax.get_xticklabels():
+            lb.set_horizontalalignment("right")
+        if show_grid:
+            ax.grid(True, linestyle="--", alpha=0.4)
+        else:
+            ax.grid(False)
+        _perf((time.perf_counter() - t_style) * 1000, PERF_GROUP_RENDER, "title_labels_ticks_grid", panel_id=pid)
 
 
 def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> str:
@@ -556,23 +617,20 @@ def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> s
 def figure_to_tk_photo(
     figure: Figure, canvas: FigureCanvasAgg, *, panel_id: str | None = None
 ) -> tk.PhotoImage:
-    t_all = time.perf_counter()
-    t0 = time.perf_counter()
-    canvas.draw()
-    ms_draw = (time.perf_counter() - t0) * 1000
-    t1 = time.perf_counter()
-    buf = io.BytesIO()
-    figure.savefig(buf, format="png")
-    ms_png = (time.perf_counter() - t1) * 1000
-    buf.seek(0)
-    raw = buf.getvalue()
-    t2 = time.perf_counter()
-    img = tk.PhotoImage(data=base64.b64encode(raw))
-    ms_tk = (time.perf_counter() - t2) * 1000
-    _perf(ms_draw, "tk_photo.canvas_agg.draw", panel_id=panel_id or "?")
-    _perf(ms_png, "tk_photo.savefig_png_bytes", panel_id=panel_id or "?", nbytes=len(raw))
-    _perf(ms_tk, "tk_photo.PhotoImage_b64", panel_id=panel_id or "?")
-    _perf((time.perf_counter() - t_all) * 1000, "figure_to_tk_photo.total", panel_id=panel_id or "?")
+    pid = panel_id or "?"
+    with _perf_region(PERF_GROUP_RENDER, "figure_to_tk_photo", panel_id=pid):
+        t0 = time.perf_counter()
+        canvas.draw()
+        _perf((time.perf_counter() - t0) * 1000, PERF_GROUP_RENDER, "canvas_agg.draw", panel_id=pid)
+        t1 = time.perf_counter()
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png")
+        raw = buf.getvalue()
+        _perf((time.perf_counter() - t1) * 1000, PERF_GROUP_RENDER, "savefig_png_bytes", panel_id=pid, nbytes=len(raw))
+        buf.seek(0)
+        t2 = time.perf_counter()
+        img = tk.PhotoImage(data=base64.b64encode(raw))
+        _perf((time.perf_counter() - t2) * 1000, PERF_GROUP_RENDER, "PhotoImage_b64_decode", panel_id=pid)
     return img
 
 
@@ -604,26 +662,25 @@ def validate_panel_config_json_list(raw: object) -> list[dict[str, object]]:
 
 
 def parse_graph_template(raw: object) -> list[dict[str, object]]:
-    t0 = time.perf_counter()
-    root_csv = ""
-    if isinstance(raw, list):
-        out = validate_panel_config_json_list(raw)
-    elif isinstance(raw, dict):
-        pr = raw.get("panels")
-        if not isinstance(pr, list):
-            raise ValueError("template object must include a non-empty 'panels' array")
-        rc = raw.get("data_csv_path")
-        if rc is not None and not isinstance(rc, str):
-            raise ValueError("template root data_csv_path must be a string")
-        root_csv = str(rc).strip() if rc else ""
-        out = validate_panel_config_json_list(pr)
-    else:
-        raise ValueError("configuration must be a JSON array or an object with 'panels'")
-    if root_csv:
-        for item in out:
-            if not str(item.get("data_csv_path") or "").strip():
-                item["data_csv_path"] = root_csv
-    _perf((time.perf_counter() - t0) * 1000, "parse_graph_template", panels=len(out))
+    with _perf_region(PERF_GROUP_CONFIG, "parse_graph_template"):
+        root_csv = ""
+        if isinstance(raw, list):
+            out = validate_panel_config_json_list(raw)
+        elif isinstance(raw, dict):
+            pr = raw.get("panels")
+            if not isinstance(pr, list):
+                raise ValueError("template object must include a non-empty 'panels' array")
+            rc = raw.get("data_csv_path")
+            if rc is not None and not isinstance(rc, str):
+                raise ValueError("template root data_csv_path must be a string")
+            root_csv = str(rc).strip() if rc else ""
+            out = validate_panel_config_json_list(pr)
+        else:
+            raise ValueError("configuration must be a JSON array or an object with 'panels'")
+        if root_csv:
+            for item in out:
+                if not str(item.get("data_csv_path") or "").strip():
+                    item["data_csv_path"] = root_csv
     return out
 
 
@@ -687,27 +744,23 @@ def _csv_scalar(v: object) -> object:
 
 
 def dataset_rows_from_wide_csv(csv_path: str, panel: ChartPanelConfig) -> list[dict[str, object]]:
-    t_all = time.perf_counter()
-    t0 = time.perf_counter()
-    df = pd.read_csv(csv_path)
-    ms_read = (time.perf_counter() - t0) * 1000
-    xk = str(panel["x_axis_value_key"])
-    yk = str(panel["y_axis_values_key"])
     pid = str(panel["id"])
-    if xk not in df.columns or yk not in df.columns:
-        raise ValueError(
-            f"CSV {csv_path!r} missing columns for panel {pid}: "
-            f"need {xk!r} and {yk!r}; columns are {list(df.columns)}"
-        )
-    rows: list[dict[str, object]] = []
-    t1 = time.perf_counter()
-    for _, row in df.iterrows():
-        rows.append({xk: _csv_scalar(row[xk]), yk: _csv_scalar(row[yk])})
-    ms_iter = (time.perf_counter() - t1) * 1000
-    ms_total = (time.perf_counter() - t_all) * 1000
-    _perf(ms_read, "csv.pd.read_csv", panel_id=pid, path=csv_path, rows=len(df))
-    _perf(ms_iter, "csv.iterrows_to_dicts", panel_id=pid, n=len(rows))
-    _perf(ms_total, "dataset_rows_from_wide_csv.total", panel_id=pid, n=len(rows))
+    with _perf_region(PERF_GROUP_CSV, "dataset_rows_from_wide_csv", panel_id=pid, path=csv_path):
+        t0 = time.perf_counter()
+        df = pd.read_csv(csv_path)
+        _perf((time.perf_counter() - t0) * 1000, PERF_GROUP_CSV, "pd.read_csv", panel_id=pid, rows=len(df))
+        xk = str(panel["x_axis_value_key"])
+        yk = str(panel["y_axis_values_key"])
+        if xk not in df.columns or yk not in df.columns:
+            raise ValueError(
+                f"CSV {csv_path!r} missing columns for panel {pid}: "
+                f"need {xk!r} and {yk!r}; columns are {list(df.columns)}"
+            )
+        rows: list[dict[str, object]] = []
+        t1 = time.perf_counter()
+        for _, row in df.iterrows():
+            rows.append({xk: _csv_scalar(row[xk]), yk: _csv_scalar(row[yk])})
+        _perf((time.perf_counter() - t1) * 1000, PERF_GROUP_CSV, "iterrows_to_row_dicts", panel_id=pid, n=len(rows))
     return rows
 
 
@@ -835,14 +888,13 @@ class SensorDashboardApp:
         lim = MAX_SENSOR_ROWS
         while len(self._sensor_rows) > lim:
             self._sensor_rows.pop(0)
-        t_poll = time.perf_counter()
-        self._rebind_dataset_refs()
-        self._render_all()
-        _perf(
-            (time.perf_counter() - t_poll) * 1000,
-            "poll_tick.rebind_and_render_all",
+        with _perf_region(
+            PERF_GROUP_POLL,
+            "poll_tick.after_sample",
             sensor_rows=len(self._sensor_rows),
-        )
+        ):
+            self._rebind_dataset_refs()
+            self._render_all()
         self.status_label.config(text=status_for_state(self._state, self.panels))
         self._schedule_next_poll()
 
@@ -1036,7 +1088,6 @@ class SensorDashboardApp:
     def _apply_panels_list(
         self, panel_dicts: list[dict[str, object]], *, initial: bool, render: bool = True
     ) -> None:
-        t_apply = time.perf_counter()
         ordered = [json.loads(json.dumps(p)) for p in panel_dicts]
         for p in ordered:
             p["data_source"] = normalize_panel_data_source(p)
@@ -1084,100 +1135,107 @@ class SensorDashboardApp:
             new_grid = {p["id"]: old.grid_visible.get(p["id"], True) for p in ordered}
             new_cfg_json = {p["id"]: old.config_json_visible.get(p["id"], False) for p in ordered}
 
-        t_destroy = time.perf_counter()
-        for w in self.charts_container.winfo_children():
-            w.destroy()
-        _perf(
-            (time.perf_counter() - t_destroy) * 1000,
-            "apply_panels.destroy_chart_widgets",
-            n_before=len(panel_dicts),
-        )
-
-        self.panels = ordered
-        self.figures = {}
-        self.figure_canvases = {}
-        self.chart_photos = {p["id"]: None for p in self.panels}
-        self.chart_labels = {}
-        self.chart_type_vars = {}
-        self.marker_style_vars = {}
-        self.marker_x_vars = {}
-        self.marker_y_vars = {}
-        self.marker_y_scales = {}
-        self.marker_x_scales = {}
-        self.marker_y_slider_wraps = {}
-        self.marker_x_slider_wraps = {}
-        self.marker_readout_y_labels = {}
-        self.marker_readout_x_labels = {}
-        self.marker_list_wraps = {}
-        self.marker_listboxes = {}
-        self.marker_label_vars = {}
-        self.marker_label_entries = {}
-        self.marker_label_frames = {}
-        self.panel_frames = {}
-        self.graph_config_labels = {}
-        self.grid_buttons = {}
-        self.config_json_buttons = {}
-
-        half = SLIDER_TICKS // 2
-        t_fig = time.perf_counter()
-        for p in self.panels:
-            pid = p["id"]
-            self.figures[pid] = Figure(figsize=(5.5, 5), dpi=100)
-            self.figure_canvases[pid] = FigureCanvasAgg(self.figures[pid])
-            v = tk.StringVar(self.root)
-            v.set(new_ct[pid])
-            self.chart_type_vars[pid] = v
-            self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_DISPLAY_NAMES[0])
-            self.marker_label_vars[pid] = tk.StringVar(master=self.root, value="")
-            self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
-            self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
-
-        _perf(
-            (time.perf_counter() - t_fig) * 1000,
-            "apply_panels.init_figures_and_tk_vars",
-            panels=len(self.panels),
-        )
-
-        n = len(self.panels)
-        t_build = time.perf_counter()
-        for i, p in enumerate(self.panels):
-            pid = p["id"]
-            self._build_panel_column(
-                self.charts_container,
-                p,
-                self._panel_column_padx(i, n),
-                grid_on=new_grid[pid],
-                config_json_on=new_cfg_json[pid],
+        n = len(ordered)
+        with _perf_region(PERF_GROUP_UI, "apply_panels_list", initial=initial, render=render, panels=n):
+            t_destroy = time.perf_counter()
+            for w in self.charts_container.winfo_children():
+                w.destroy()
+            _perf(
+                (time.perf_counter() - t_destroy) * 1000,
+                PERF_GROUP_UI,
+                "destroy_chart_widgets",
+                n_widgets_cleared=n,
             )
-        _perf((time.perf_counter() - t_build) * 1000, "apply_panels.build_panel_columns", panels=n)
 
-        self._set_state(
-            SensorAppState(
-                datasets=new_ds,
-                chart_types=new_ct,
-                markers=new_markers,
-                marker_selected_index=new_msi,
-                grid_visible=new_grid,
-                config_json_visible=new_cfg_json,
-            ),
-        )
-        t_msync = time.perf_counter()
-        for p in self.panels:
-            pid = p["id"]
-            self._normalize_marker_selection(pid)
-            self._sync_marker_slider_ui(pid)
-        _perf((time.perf_counter() - t_msync) * 1000, "apply_panels.marker_ui_sync", panels=n)
-        if render:
-            self._render_all()
-        if render:
-            self._start_sensor_poll_if_needed()
-        _perf(
-            (time.perf_counter() - t_apply) * 1000,
-            "apply_panels.total",
-            initial=initial,
-            render=render,
-            panels=n,
-        )
+            self.panels = ordered
+            self.figures = {}
+            self.figure_canvases = {}
+            self.chart_photos = {p["id"]: None for p in self.panels}
+            self.chart_labels = {}
+            self.chart_type_vars = {}
+            self.marker_style_vars = {}
+            self.marker_x_vars = {}
+            self.marker_y_vars = {}
+            self.marker_y_scales = {}
+            self.marker_x_scales = {}
+            self.marker_y_slider_wraps = {}
+            self.marker_x_slider_wraps = {}
+            self.marker_readout_y_labels = {}
+            self.marker_readout_x_labels = {}
+            self.marker_list_wraps = {}
+            self.marker_listboxes = {}
+            self.marker_label_vars = {}
+            self.marker_label_entries = {}
+            self.marker_label_frames = {}
+            self.panel_frames = {}
+            self.graph_config_labels = {}
+            self.grid_buttons = {}
+            self.config_json_buttons = {}
+
+            half = SLIDER_TICKS // 2
+            t_fig = time.perf_counter()
+            for p in self.panels:
+                pid = p["id"]
+                self.figures[pid] = Figure(figsize=(5.5, 5), dpi=100)
+                self.figure_canvases[pid] = FigureCanvasAgg(self.figures[pid])
+                v = tk.StringVar(self.root)
+                v.set(new_ct[pid])
+                self.chart_type_vars[pid] = v
+                self.marker_style_vars[pid] = tk.StringVar(master=self.root, value=MARKER_STYLE_DISPLAY_NAMES[0])
+                self.marker_label_vars[pid] = tk.StringVar(master=self.root, value="")
+                self.marker_x_vars[pid] = tk.IntVar(master=self.root, value=half)
+                self.marker_y_vars[pid] = tk.IntVar(master=self.root, value=half)
+
+            _perf(
+                (time.perf_counter() - t_fig) * 1000,
+                PERF_GROUP_UI,
+                "init_figures_and_tk_vars",
+                panels=len(self.panels),
+            )
+
+            n_panels = len(self.panels)
+            t_build = time.perf_counter()
+            for i, p in enumerate(self.panels):
+                pid = p["id"]
+                self._build_panel_column(
+                    self.charts_container,
+                    p,
+                    self._panel_column_padx(i, n_panels),
+                    grid_on=new_grid[pid],
+                    config_json_on=new_cfg_json[pid],
+                )
+            _perf(
+                (time.perf_counter() - t_build) * 1000,
+                PERF_GROUP_UI,
+                "build_panel_columns_loop",
+                panels=n_panels,
+            )
+
+            self._set_state(
+                SensorAppState(
+                    datasets=new_ds,
+                    chart_types=new_ct,
+                    markers=new_markers,
+                    marker_selected_index=new_msi,
+                    grid_visible=new_grid,
+                    config_json_visible=new_cfg_json,
+                ),
+            )
+            t_msync = time.perf_counter()
+            for p in self.panels:
+                pid = p["id"]
+                self._normalize_marker_selection(pid)
+                self._sync_marker_slider_ui(pid)
+            _perf(
+                (time.perf_counter() - t_msync) * 1000,
+                PERF_GROUP_UI,
+                "marker_ui_sync_loop",
+                panels=n_panels,
+            )
+            if render:
+                self._render_all()
+            if render:
+                self._start_sensor_poll_if_needed()
 
     def _set_state(self, state: SensorAppState) -> None:
         self._state = state
@@ -1503,38 +1561,33 @@ class SensorDashboardApp:
         self._set_state(replace(self._state, chart_types=new_ct))
 
     def _refresh_datasets(self) -> None:
-        t0 = time.perf_counter()
-        self._sync_chart_types_from_ui()
-        datasets: dict[str, list[dict[str, object]] | None] = {}
-        summaries: list[str] = []
-        for p in self.panels:
-            pid = p["id"]
-            if panel_uses_sensor(p):
-                datasets[pid] = self._sensor_rows
-                summaries.append(f"{pid}: sensor({len(self._sensor_rows)})")
-            else:
-                rel = str(p.get("data_csv_path") or "").strip()
-                if not rel:
-                    messagebox.showerror(
-                        "CSV",
-                        f"Panel {pid}: set data_csv_path for file source in the JSON configuration and load it again.",
-                    )
-                    return
-                fp = self._resolved_csv_path(rel)
-                try:
-                    datasets[pid] = dataset_rows_from_wide_csv(fp, p)
-                except (OSError, ValueError) as e:
-                    messagebox.showerror("CSV data", str(e))
-                    return
-                summaries.append(f"{pid}: CSV({len(datasets[pid] or [])})")
-        self._set_state(replace(self._state, datasets=datasets))
-        self.status_label.config(text=" · ".join(summaries))
-        self._start_sensor_poll_if_needed()
-        _perf(
-            (time.perf_counter() - t0) * 1000,
-            "refresh_datasets.total",
-            panels=len(self.panels),
-        )
+        with _perf_region(PERF_GROUP_DATA, "refresh_datasets", panels=len(self.panels)):
+            self._sync_chart_types_from_ui()
+            datasets: dict[str, list[dict[str, object]] | None] = {}
+            summaries: list[str] = []
+            for p in self.panels:
+                pid = p["id"]
+                if panel_uses_sensor(p):
+                    datasets[pid] = self._sensor_rows
+                    summaries.append(f"{pid}: sensor({len(self._sensor_rows)})")
+                else:
+                    rel = str(p.get("data_csv_path") or "").strip()
+                    if not rel:
+                        messagebox.showerror(
+                            "CSV",
+                            f"Panel {pid}: set data_csv_path for file source in the JSON configuration and load it again.",
+                        )
+                        return
+                    fp = self._resolved_csv_path(rel)
+                    try:
+                        datasets[pid] = dataset_rows_from_wide_csv(fp, p)
+                    except (OSError, ValueError) as e:
+                        messagebox.showerror("CSV data", str(e))
+                        return
+                    summaries.append(f"{pid}: CSV({len(datasets[pid] or [])})")
+            self._set_state(replace(self._state, datasets=datasets))
+            self.status_label.config(text=" · ".join(summaries))
+            self._start_sensor_poll_if_needed()
 
     def _on_chart_type_change(self, panel_id: str) -> None:
         ct = normalize_chart_type(self.chart_type_vars[panel_id].get())
@@ -1588,73 +1641,67 @@ class SensorDashboardApp:
         )
         if not path:
             return
-        t_load = time.perf_counter()
-        try:
-            with open(path, encoding="utf-8") as f:
-                raw = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            messagebox.showerror("Load configuration", str(e))
-            return
-        _perf((time.perf_counter() - t_load) * 1000, "load_config.json_read", path=path)
-        self._template_dir = os.path.dirname(os.path.abspath(path))
-        try:
-            validated = parse_graph_template(raw)
-        except ValueError as e:
-            messagebox.showerror("Load configuration", str(e))
-            return
-        t_apply = time.perf_counter()
-        self._apply_panels_list(validated, initial=False, render=False)
-        _perf((time.perf_counter() - t_apply) * 1000, "load_config.apply_panels_list")
-        t_refresh = time.perf_counter()
-        self._refresh_datasets()
-        _perf((time.perf_counter() - t_refresh) * 1000, "load_config.refresh_datasets")
-        t_render = time.perf_counter()
-        self._render_all()
-        _perf((time.perf_counter() - t_render) * 1000, "load_config.render_all")
+        with _perf_region(PERF_GROUP_CONFIG, "load_configuration", path=path):
+            t_load = time.perf_counter()
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                messagebox.showerror("Load configuration", str(e))
+                return
+            _perf((time.perf_counter() - t_load) * 1000, PERF_GROUP_CONFIG, "json.load", path=path)
+            self._template_dir = os.path.dirname(os.path.abspath(path))
+            try:
+                validated = parse_graph_template(raw)
+            except ValueError as e:
+                messagebox.showerror("Load configuration", str(e))
+                return
+            self._apply_panels_list(validated, initial=False, render=False)
+            self._refresh_datasets()
+            self._render_all()
 
     def _render_panel(self, panel_id: str) -> None:
-        t_all = time.perf_counter()
-        self._sync_chart_types_from_ui()
-        self._normalize_marker_selection(panel_id)
-        panel = next(p for p in self.panels if p["id"] == panel_id)
-        records = self._state.datasets.get(panel_id)
-        marks = self._state.markers.get(panel_id, ())
-        sel = self._state.marker_selected_index.get(panel_id) if marks else None
-        ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
-        render_chart_figure(
-            self.figures[panel_id],
-            records,
-            ct,
-            panel_figure_config(panel),
-            show_grid=self._state.grid_visible.get(panel_id, True),
-            markers=marks,
-            marker_selected_index=sel,
-            panel_id=panel_id,
-            chart_type_normalized=ct,
-        )
-        self.chart_photos[panel_id] = figure_to_tk_photo(
-            self.figures[panel_id],
-            self.figure_canvases[panel_id],
-            panel_id=panel_id,
-        )
-        t_ui = time.perf_counter()
-        self.chart_labels[panel_id].config(image=self.chart_photos[panel_id])
-        self.status_label.config(text=status_for_state(self._state, self.panels))
-        self._sync_marker_slider_ui(panel_id)
-        self._refresh_marker_list(panel_id)
-        _perf((time.perf_counter() - t_ui) * 1000, "render_panel.tk_sync_and_markers", panel_id=panel_id)
-        _perf((time.perf_counter() - t_all) * 1000, "render_panel.total", panel_id=panel_id)
+        with _perf_region(PERF_GROUP_RENDER, "_render_panel", panel_id=panel_id):
+            self._sync_chart_types_from_ui()
+            self._normalize_marker_selection(panel_id)
+            panel = next(p for p in self.panels if p["id"] == panel_id)
+            records = self._state.datasets.get(panel_id)
+            marks = self._state.markers.get(panel_id, ())
+            sel = self._state.marker_selected_index.get(panel_id) if marks else None
+            ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+            render_chart_figure(
+                self.figures[panel_id],
+                records,
+                ct,
+                panel_figure_config(panel),
+                show_grid=self._state.grid_visible.get(panel_id, True),
+                markers=marks,
+                marker_selected_index=sel,
+                panel_id=panel_id,
+                chart_type_normalized=ct,
+            )
+            self.chart_photos[panel_id] = figure_to_tk_photo(
+                self.figures[panel_id],
+                self.figure_canvases[panel_id],
+                panel_id=panel_id,
+            )
+            t_ui = time.perf_counter()
+            self.chart_labels[panel_id].config(image=self.chart_photos[panel_id])
+            self.status_label.config(text=status_for_state(self._state, self.panels))
+            self._sync_marker_slider_ui(panel_id)
+            self._refresh_marker_list(panel_id)
+            _perf(
+                (time.perf_counter() - t_ui) * 1000,
+                PERF_GROUP_RENDER,
+                "tk.label_markers_lists",
+                panel_id=panel_id,
+            )
 
     def _render_all(self) -> None:
-        ta = time.perf_counter()
-        self._sync_chart_types_from_ui()
-        for p in self.panels:
-            self._render_panel(p["id"])
-        _perf(
-            (time.perf_counter() - ta) * 1000,
-            "render_all.total",
-            panels=len(self.panels),
-        )
+        with _perf_region(PERF_GROUP_RENDER, "_render_all", panels=len(self.panels)):
+            self._sync_chart_types_from_ui()
+            for p in self.panels:
+                self._render_panel(p["id"])
 
 
 def run() -> None:
