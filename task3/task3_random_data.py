@@ -193,6 +193,20 @@ def chart_config_display_text(config: ChartFigureConfig) -> str:
     return json.dumps(config, indent=2, sort_keys=True)
 
 
+def records_render_fingerprint(
+    panel: ChartPanelConfig,
+    records: list[dict[str, object]] | None,
+) -> tuple[object, ...]:
+    if not records:
+        return ("empty",)
+    xk = panel["x_axis_value_key"]
+    yk = panel["y_axis_values_key"]
+    h = 5381
+    for r in records:
+        h = ((h * 33) ^ hash((r[xk], r[yk]))) & 0xFFFFFFFFFFFFFFFF
+    return (len(records), h)
+
+
 @dataclass(frozen=True)
 class ChartMarker:
     style: str
@@ -476,7 +490,7 @@ def draw_series(
         _perf((time.perf_counter() - t_y) * 1000, PERF_GROUP_RENDER, "materialize_y_list", n=len(y_seq))
         if ct == "line":
             t_lp = time.perf_counter()
-            sns.lineplot(x=x, y=y_seq, ax=ax)
+            sns.lineplot(x=x, y=y_seq, ax=ax, errorbar=None)
             _perf((time.perf_counter() - t_lp) * 1000, PERF_GROUP_RENDER, "sns.lineplot")
             t_sc = time.perf_counter()
             ax.scatter(x, y_seq, color="red", s=50, zorder=5)
@@ -812,6 +826,7 @@ class SensorDashboardApp:
         self.grid_buttons: dict[str, tk.Button] = {}
         self.config_json_buttons: dict[str, tk.Button] = {}
         self._template_dir: str | None = None
+        self._last_render_sig: dict[str, object] = {}
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -1150,6 +1165,7 @@ class SensorDashboardApp:
             self.panels = ordered
             self.figures = {}
             self.figure_canvases = {}
+            self._last_render_sig.clear()
             self.chart_photos = {p["id"]: None for p in self.panels}
             self.chart_labels = {}
             self.chart_type_vars = {}
@@ -1248,6 +1264,23 @@ class SensorDashboardApp:
             return os.path.normpath(rel)
         base = self._template_dir if self._template_dir else os.getcwd()
         return os.path.normpath(os.path.join(base, rel))
+
+    def _chart_render_signature(self, panel_id: str) -> tuple[object, ...]:
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        records = self._state.datasets.get(panel_id)
+        marks = self._state.markers.get(panel_id, ())
+        sel = self._state.marker_selected_index.get(panel_id) if marks else None
+        ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+        cfg_txt = chart_config_display_text(panel_figure_config(panel))
+        grid_on = self._state.grid_visible.get(panel_id, True)
+        return (
+            cfg_txt,
+            ct,
+            grid_on,
+            marks,
+            sel,
+            records_render_fingerprint(panel, records),
+        )
 
     def _save_data_csv(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1664,27 +1697,33 @@ class SensorDashboardApp:
         with _perf_region(PERF_GROUP_RENDER, "_render_panel", panel_id=panel_id):
             self._sync_chart_types_from_ui()
             self._normalize_marker_selection(panel_id)
-            panel = next(p for p in self.panels if p["id"] == panel_id)
-            records = self._state.datasets.get(panel_id)
-            marks = self._state.markers.get(panel_id, ())
-            sel = self._state.marker_selected_index.get(panel_id) if marks else None
-            ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
-            render_chart_figure(
-                self.figures[panel_id],
-                records,
-                ct,
-                panel_figure_config(panel),
-                show_grid=self._state.grid_visible.get(panel_id, True),
-                markers=marks,
-                marker_selected_index=sel,
-                panel_id=panel_id,
-                chart_type_normalized=ct,
-            )
-            self.chart_photos[panel_id] = figure_to_tk_photo(
-                self.figures[panel_id],
-                self.figure_canvases[panel_id],
-                panel_id=panel_id,
-            )
+            sig = self._chart_render_signature(panel_id)
+            cached = sig == self._last_render_sig.get(panel_id) and self.chart_photos.get(panel_id) is not None
+            if cached:
+                _perf_emit(PERF_GROUP_RENDER, "·", "render_panel_cache_hit", None, panel_id=panel_id)
+            else:
+                panel = next(p for p in self.panels if p["id"] == panel_id)
+                records = self._state.datasets.get(panel_id)
+                marks = self._state.markers.get(panel_id, ())
+                sel = self._state.marker_selected_index.get(panel_id) if marks else None
+                ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+                render_chart_figure(
+                    self.figures[panel_id],
+                    records,
+                    ct,
+                    panel_figure_config(panel),
+                    show_grid=self._state.grid_visible.get(panel_id, True),
+                    markers=marks,
+                    marker_selected_index=sel,
+                    panel_id=panel_id,
+                    chart_type_normalized=ct,
+                )
+                self.chart_photos[panel_id] = figure_to_tk_photo(
+                    self.figures[panel_id],
+                    self.figure_canvases[panel_id],
+                    panel_id=panel_id,
+                )
+                self._last_render_sig[panel_id] = sig
             t_ui = time.perf_counter()
             self.chart_labels[panel_id].config(image=self.chart_photos[panel_id])
             self.status_label.config(text=status_for_state(self._state, self.panels))
