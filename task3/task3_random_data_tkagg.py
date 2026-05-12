@@ -41,6 +41,13 @@ MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
 MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
 MARKER_SLIDE_DEBOUNCE_MS = 24
+
+
+def _marker_slider_dbg(panel_id: str, msg: str, **kv: object) -> None:
+    tail = "" if not kv else " " + " ".join(f"{k}={v!r}" for k, v in kv.items())
+    print(f"[task3_marker_slider {panel_id}] {msg}{tail}", flush=True)
+
+
 POLL_INTERVAL_MS = 3000
 MAX_SENSOR_ROWS = 10_000
 DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
@@ -1563,6 +1570,14 @@ class SensorDashboardApp:
             y_scale.config(state=tk.NORMAL)
             x_scale.config(state=tk.NORMAL)
             idx = self._effective_marker_index(panel_id)
+            _marker_slider_dbg(
+                panel_id,
+                "sync enter",
+                sel_idx=sel_idx,
+                eff_idx=idx,
+                n_records=len(records) if records else 0,
+                suppress_slide=self._suppress_marker_slide,
+            )
             if idx is not None and records:
                 picked = cur[idx]
                 self._suppress_marker_slide = True
@@ -1573,17 +1588,69 @@ class SensorDashboardApp:
                     xc, _ = coerce_time_axis_x(xk, xv_raw)
                     yc = [r[yk] for r in records]
                     kxs = [_key_x(v) for v in xc]
-                    if len(kxs) > 1 and max(kxs) > min(kxs):
+                    ix_before = self.marker_x_vars[panel_id].get()
+                    iy_before = self.marker_y_vars[panel_id].get()
+                    x_span_ok = len(kxs) > 1 and max(kxs) > min(kxs)
+                    if x_span_ok:
                         xi_fr = sample_frac_from_data(xc, picked.x_value)
                         nx = max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
-                        if self.marker_x_vars[panel_id].get() != nx:
+                        x_changed = ix_before != nx
+                        if x_changed:
                             self.marker_x_vars[panel_id].set(nx)
+                        _marker_slider_dbg(
+                            panel_id,
+                            "sync x",
+                            x_span_ok=True,
+                            kxs_min=min(kxs),
+                            kxs_max=max(kxs),
+                            picked_x_repr=_annotate_x_text(picked.x_value),
+                            xi_fr=xi_fr,
+                            tick_before=ix_before,
+                            tick_after=nx,
+                            var_set=x_changed,
+                            x_tail_preview=[repr(v) for v in xc[-3:]],
+                        )
+                    else:
+                        _marker_slider_dbg(
+                            panel_id,
+                            "sync x SKIP degenerate",
+                            len_kxs=len(kxs),
+                            kxs_min=min(kxs) if kxs else None,
+                            kxs_max=max(kxs) if kxs else None,
+                            ix_var=ix_before,
+                            picked_x_repr=_annotate_x_text(picked.x_value),
+                        )
                     kys = [_key_x(v) for v in yc]
-                    if len(kys) > 1 and max(kys) > min(kys):
+                    y_span_ok = len(kys) > 1 and max(kys) > min(kys)
+                    if y_span_ok:
                         yi_fr = sample_frac_from_data(yc, picked.y_value)
                         ny = max(0, min(SLIDER_TICKS, round(yi_fr * SLIDER_TICKS)))
-                        if self.marker_y_vars[panel_id].get() != ny:
+                        y_changed = iy_before != ny
+                        if y_changed:
                             self.marker_y_vars[panel_id].set(ny)
+                        _marker_slider_dbg(
+                            panel_id,
+                            "sync y",
+                            y_span_ok=True,
+                            kys_min=min(kys),
+                            kys_max=max(kys),
+                            picked_y=float(picked.y_value),
+                            yi_fr=yi_fr,
+                            tick_before=iy_before,
+                            tick_after=ny,
+                            var_set=y_changed,
+                            y_tail_preview=[float(v) for v in yc[-3:]],
+                        )
+                    else:
+                        _marker_slider_dbg(
+                            panel_id,
+                            "sync y SKIP degenerate",
+                            len_kys=len(kys),
+                            kys_min=min(kys) if kys else None,
+                            kys_max=max(kys) if kys else None,
+                            iy_var=iy_before,
+                            picked_y=float(picked.y_value),
+                        )
                 finally:
                     self._suppress_marker_slide = False
 
@@ -1597,6 +1664,12 @@ class SensorDashboardApp:
                     ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
                     rx.config(text=_annotate_x_text(picked.x_value))
             else:
+                _marker_slider_dbg(
+                    panel_id,
+                    "sync no records or idx",
+                    eff_idx=idx,
+                    n_records=len(records) if records else 0,
+                )
                 lx, ly = marker_axis_readout_lines(panel, records, cur)
                 ry.config(text=ly)
                 rx.config(text=lx)
@@ -1696,6 +1769,15 @@ class SensorDashboardApp:
         xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
         x_new = data_at_sample_frac(xc, xf)
+        _marker_slider_dbg(
+            panel_id,
+            "x_slide",
+            tick=self.marker_x_vars[panel_id].get(),
+            xf=xf,
+            n_x=len(xc),
+            old_x_repr=_annotate_x_text(old.x_value),
+            x_new_repr=_annotate_x_text(x_new),
+        )
         self._replace_marker_at(panel_id, idx, replace(old, x_value=x_new))
         self._schedule_marker_slide_render(panel_id)
 
@@ -1715,6 +1797,15 @@ class SensorDashboardApp:
         yf = max(0.0, min(1.0, self.marker_y_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
         y_new = float(data_at_sample_frac(yc, yf))
+        _marker_slider_dbg(
+            panel_id,
+            "y_slide",
+            tick=self.marker_y_vars[panel_id].get(),
+            yf=yf,
+            n_y=len(yc),
+            old_y=old.y_value,
+            y_new=y_new,
+        )
         self._replace_marker_at(panel_id, idx, replace(old, y_value=y_new))
         self._schedule_marker_slide_render(panel_id)
 
@@ -1732,6 +1823,7 @@ class SensorDashboardApp:
 
     def _on_marker_slide_debounced(self, panel_id: str) -> None:
         self._marker_slide_after_ids[panel_id] = None
+        print(f"[task3_marker_slider {panel_id}] debounced_render fire", flush=True)
         self._render_panel(panel_id)
 
     def _sync_chart_types_from_ui(self) -> None:
