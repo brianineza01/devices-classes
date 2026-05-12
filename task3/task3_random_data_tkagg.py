@@ -364,6 +364,110 @@ def marker_axes_x(ax, chart_type: str, x_coords: list[object], x_value: object) 
     return x_value
 
 
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, v))
+
+
+def _blend_two_x(a: object, b: object, t: float) -> object:
+    t = _clamp01(t)
+    if isinstance(a, datetime) and isinstance(b, datetime):
+        span_sec = (b - a).total_seconds()
+        if span_sec <= 0:
+            return a
+        return a + timedelta(seconds=span_sec * t)
+    return float(a) + (float(b) - float(a)) * t
+
+
+def axis_mx_to_bar_data_x(ax, x_coords: list[object], mx: float) -> object:
+    n = len(x_coords)
+    if n == 0:
+        return mx
+    patches = ax.patches
+    if len(patches) < n:
+        return x_coords[0]
+    centers = [float(patches[i].get_x() + patches[i].get_width() / 2) for i in range(n)]
+    if mx <= centers[0]:
+        return x_coords[0]
+    if mx >= centers[-1]:
+        return x_coords[-1]
+    for i in range(n - 1):
+        c0, c1 = centers[i], centers[i + 1]
+        lo, hi = (c0, c1) if c0 <= c1 else (c1, c0)
+        if mx < lo or mx > hi:
+            continue
+        span = c1 - c0
+        tt = 0.0 if span == 0 else (mx - c0) / span
+        return _blend_two_x(x_coords[i], x_coords[i + 1], tt)
+    return x_coords[-1]
+
+
+def _scalar_from_marker_x_domain(x_value: object, *, x_is_time: bool) -> float:
+    if x_is_time:
+        dt = x_value if isinstance(x_value, datetime) else _parse_time_value(x_value)
+        return float(mdates.date2num(dt))
+    return float(x_value)
+
+
+def _marker_x_domain_from_scalar(v: float, *, x_is_time: bool) -> object:
+    if x_is_time:
+        dt = mdates.num2date(v)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    return v
+
+
+def marker_scalar_for_axis_slider(
+    ax,
+    chart_type: str,
+    x_coords: list[object],
+    x_value: object,
+    *,
+    x_is_time: bool,
+) -> float:
+    ct = normalize_chart_type(chart_type)
+    if ct == "bar" and ax is not None and ax.patches and x_coords:
+        return float(marker_axes_x(ax, ct, x_coords, x_value))
+    return _scalar_from_marker_x_domain(x_value, x_is_time=x_is_time)
+
+
+def marker_axis_frac_from_values(
+    x_scalar: float,
+    y_value: float,
+    *,
+    xlo: float,
+    xhi: float,
+    ylo: float,
+    yhi: float,
+) -> tuple[float, float]:
+    xf = 0.5 if math.isclose(xlo, xhi) else _clamp01((x_scalar - xlo) / (xhi - xlo))
+    yf = 0.5 if math.isclose(ylo, yhi) else _clamp01((y_value - ylo) / (yhi - ylo))
+    return xf, yf
+
+
+def marker_values_from_axis_fracs(
+    x_frac: float,
+    y_frac: float,
+    *,
+    xlo: float,
+    xhi: float,
+    ylo: float,
+    yhi: float,
+    ax,
+    chart_type: str,
+    x_coords: list[object],
+    x_is_time: bool,
+) -> tuple[object, float]:
+    xf = _clamp01(x_frac)
+    yf = _clamp01(y_frac)
+    x_canvas = xlo + xf * (xhi - xlo)
+    ct = normalize_chart_type(chart_type)
+    if ct == "bar" and ax is not None and ax.patches and x_coords:
+        x_new = axis_mx_to_bar_data_x(ax, x_coords, x_canvas)
+    else:
+        x_new = _marker_x_domain_from_scalar(x_canvas, x_is_time=x_is_time)
+    y_new = ylo + yf * (yhi - ylo)
+    return x_new, float(y_new)
+
+
 def draw_seaborn_markers(
     ax,
     *,
@@ -623,7 +727,7 @@ def render_chart_figure(
     marker_selected_index: int | None,
     panel_id: str | None = None,
     chart_type_normalized: str | None = None,
-) -> list[Artist]:
+) -> tuple[list[Artist], tuple[float, float, float, float] | None]:
     pid = panel_id or "?"
     ct_label = chart_type_normalized or normalize_chart_type(chart_type)
     nrec = len(records) if records else 0
@@ -634,7 +738,7 @@ def render_chart_figure(
         figure.subplots_adjust(bottom=0.24)
         _perf((time.perf_counter() - t_clear) * 1000, PERF_GROUP_RENDER, "figure.clear_and_margin", panel_id=pid)
         if not records:
-            return []
+            return [], None
         t_data = time.perf_counter()
         xk = config["x_axis_value_key"]
         yk = config["y_axis_values_key"]
@@ -693,8 +797,11 @@ def render_chart_figure(
             ax.grid(False)
         if ct_label != "bar":
             ax.margins(x=0)
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+        limits = (float(xlo), float(xhi), float(ylo), float(yhi))
         _perf((time.perf_counter() - t_style) * 1000, PERF_GROUP_RENDER, "title_labels_ticks_grid", panel_id=pid)
-    return marker_artists
+    return marker_artists, limits
 
 
 def update_chart_markers_only(
@@ -933,6 +1040,7 @@ class SensorDashboardApp:
         self._last_plot_sig: dict[str, object] = {}
         self._marker_artists: dict[str, list[Artist]] = {}
         self._marker_slide_after_ids: dict[str, str | None] = {}
+        self._panel_axis_limits: dict[str, tuple[float, float, float, float]] = {}
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -1284,6 +1392,7 @@ class SensorDashboardApp:
                     except tk.TclError:
                         pass
             self._marker_slide_after_ids.clear()
+            self._panel_axis_limits.clear()
             self._last_render_sig.clear()
             self._last_plot_sig.clear()
             self._marker_artists.clear()
@@ -1583,73 +1692,57 @@ class SensorDashboardApp:
                 self._suppress_marker_slide = True
                 try:
                     xk = panel["x_axis_value_key"]
-                    yk = panel["y_axis_values_key"]
                     xv_raw = [r[xk] for r in records]
-                    xc, _ = coerce_time_axis_x(xk, xv_raw)
-                    yc = [r[yk] for r in records]
-                    kxs = [_key_x(v) for v in xc]
+                    xc, x_is_time = coerce_time_axis_x(xk, xv_raw)
                     ix_before = self.marker_x_vars[panel_id].get()
                     iy_before = self.marker_y_vars[panel_id].get()
-                    x_span_ok = len(kxs) > 1 and max(kxs) > min(kxs)
-                    if x_span_ok:
-                        xi_fr = sample_frac_from_data(xc, picked.x_value)
-                        nx = max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
+                    limits = self._panel_axis_limits.get(panel_id)
+                    fig = self.figures.get(panel_id)
+                    ax = fig.axes[0] if fig is not None and fig.axes else None
+                    ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+                    if limits:
+                        xlo, xhi, ylo, yhi = limits
+                        x_scalar = marker_scalar_for_axis_slider(
+                            ax, ct, xc, picked.x_value, x_is_time=x_is_time
+                        )
+                        xf, yf = marker_axis_frac_from_values(
+                            x_scalar,
+                            float(picked.y_value),
+                            xlo=xlo,
+                            xhi=xhi,
+                            ylo=ylo,
+                            yhi=yhi,
+                        )
+                        nx = max(0, min(SLIDER_TICKS, round(xf * SLIDER_TICKS)))
+                        ny = max(0, min(SLIDER_TICKS, round(yf * SLIDER_TICKS)))
                         x_changed = ix_before != nx
+                        y_changed = iy_before != ny
                         if x_changed:
                             self.marker_x_vars[panel_id].set(nx)
-                        _marker_slider_dbg(
-                            panel_id,
-                            "sync x",
-                            x_span_ok=True,
-                            kxs_min=min(kxs),
-                            kxs_max=max(kxs),
-                            picked_x_repr=_annotate_x_text(picked.x_value),
-                            xi_fr=xi_fr,
-                            tick_before=ix_before,
-                            tick_after=nx,
-                            var_set=x_changed,
-                            x_tail_preview=[repr(v) for v in xc[-3:]],
-                        )
-                    else:
-                        _marker_slider_dbg(
-                            panel_id,
-                            "sync x SKIP degenerate",
-                            len_kxs=len(kxs),
-                            kxs_min=min(kxs) if kxs else None,
-                            kxs_max=max(kxs) if kxs else None,
-                            ix_var=ix_before,
-                            picked_x_repr=_annotate_x_text(picked.x_value),
-                        )
-                    kys = [_key_x(v) for v in yc]
-                    y_span_ok = len(kys) > 1 and max(kys) > min(kys)
-                    if y_span_ok:
-                        yi_fr = sample_frac_from_data(yc, picked.y_value)
-                        ny = max(0, min(SLIDER_TICKS, round(yi_fr * SLIDER_TICKS)))
-                        y_changed = iy_before != ny
                         if y_changed:
                             self.marker_y_vars[panel_id].set(ny)
                         _marker_slider_dbg(
                             panel_id,
-                            "sync y",
-                            y_span_ok=True,
-                            kys_min=min(kys),
-                            kys_max=max(kys),
+                            "sync axis_mapped",
+                            limits=limits,
+                            xf=xf,
+                            yf=yf,
+                            tick_before_x=ix_before,
+                            tick_after_x=nx,
+                            tick_before_y=iy_before,
+                            tick_after_y=ny,
+                            var_set_x=x_changed,
+                            var_set_y=y_changed,
+                            picked_x_repr=_annotate_x_text(picked.x_value),
                             picked_y=float(picked.y_value),
-                            yi_fr=yi_fr,
-                            tick_before=iy_before,
-                            tick_after=ny,
-                            var_set=y_changed,
-                            y_tail_preview=[float(v) for v in yc[-3:]],
                         )
                     else:
                         _marker_slider_dbg(
                             panel_id,
-                            "sync y SKIP degenerate",
-                            len_kys=len(kys),
-                            kys_min=min(kys) if kys else None,
-                            kys_max=max(kys) if kys else None,
+                            "sync no_axis_limits",
+                            n_records=len(records),
+                            ix_var=ix_before,
                             iy_var=iy_before,
-                            picked_y=float(picked.y_value),
                         )
                 finally:
                     self._suppress_marker_slide = False
@@ -1762,19 +1855,45 @@ class SensorDashboardApp:
         records = self._state.datasets.get(panel_id)
         if not records:
             return
+        limits = self._panel_axis_limits.get(panel_id)
+        if not limits:
+            return
         panel = next(p for p in self.panels if p["id"] == panel_id)
         xk = panel["x_axis_value_key"]
-        xc, _ = coerce_time_axis_x(xk, [r[xk] for r in records])
+        xc, x_is_time = coerce_time_axis_x(xk, [r[xk] for r in records])
         cur = tuple(self._state.markers.get(panel_id, ()))
-        xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
+        xf = _clamp01(self.marker_x_vars[panel_id].get() / SLIDER_TICKS)
         old = cur[idx]
-        x_new = data_at_sample_frac(xc, xf)
+        xlo, xhi, ylo, yhi = limits
+        fig = self.figures.get(panel_id)
+        ax = fig.axes[0] if fig is not None and fig.axes else None
+        ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+        _, y_hold = marker_axis_frac_from_values(
+            marker_scalar_for_axis_slider(ax, ct, xc, old.x_value, x_is_time=x_is_time),
+            float(old.y_value),
+            xlo=xlo,
+            xhi=xhi,
+            ylo=ylo,
+            yhi=yhi,
+        )
+        x_new, _ = marker_values_from_axis_fracs(
+            xf,
+            y_hold,
+            xlo=xlo,
+            xhi=xhi,
+            ylo=ylo,
+            yhi=yhi,
+            ax=ax,
+            chart_type=ct,
+            x_coords=xc,
+            x_is_time=x_is_time,
+        )
         _marker_slider_dbg(
             panel_id,
             "x_slide",
             tick=self.marker_x_vars[panel_id].get(),
             xf=xf,
-            n_x=len(xc),
+            limits=limits,
             old_x_repr=_annotate_x_text(old.x_value),
             x_new_repr=_annotate_x_text(x_new),
         )
@@ -1790,19 +1909,45 @@ class SensorDashboardApp:
         records = self._state.datasets.get(panel_id)
         if not records:
             return
+        limits = self._panel_axis_limits.get(panel_id)
+        if not limits:
+            return
         panel = next(p for p in self.panels if p["id"] == panel_id)
-        yk = panel["y_axis_values_key"]
-        yc = [r[yk] for r in records]
+        xk = panel["x_axis_value_key"]
+        xc, x_is_time = coerce_time_axis_x(xk, [r[xk] for r in records])
         cur = tuple(self._state.markers.get(panel_id, ()))
-        yf = max(0.0, min(1.0, self.marker_y_vars[panel_id].get() / SLIDER_TICKS))
+        yf = _clamp01(self.marker_y_vars[panel_id].get() / SLIDER_TICKS)
         old = cur[idx]
-        y_new = float(data_at_sample_frac(yc, yf))
+        xlo, xhi, ylo, yhi = limits
+        fig = self.figures.get(panel_id)
+        ax = fig.axes[0] if fig is not None and fig.axes else None
+        ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+        x_hold, _ = marker_axis_frac_from_values(
+            marker_scalar_for_axis_slider(ax, ct, xc, old.x_value, x_is_time=x_is_time),
+            float(old.y_value),
+            xlo=xlo,
+            xhi=xhi,
+            ylo=ylo,
+            yhi=yhi,
+        )
+        _, y_new = marker_values_from_axis_fracs(
+            x_hold,
+            yf,
+            xlo=xlo,
+            xhi=xhi,
+            ylo=ylo,
+            yhi=yhi,
+            ax=ax,
+            chart_type=ct,
+            x_coords=xc,
+            x_is_time=x_is_time,
+        )
         _marker_slider_dbg(
             panel_id,
             "y_slide",
             tick=self.marker_y_vars[panel_id].get(),
             yf=yf,
-            n_y=len(yc),
+            limits=limits,
             old_y=old.y_value,
             y_new=y_new,
         )
@@ -1989,7 +2134,7 @@ class SensorDashboardApp:
                         panel_id=panel_id,
                     )
                 else:
-                    new_m = render_chart_figure(
+                    new_m, axis_lim = render_chart_figure(
                         fig,
                         records,
                         ct,
@@ -2001,6 +2146,10 @@ class SensorDashboardApp:
                         chart_type_normalized=ct,
                     )
                     self._marker_artists[panel_id] = new_m
+                    if axis_lim is not None:
+                        self._panel_axis_limits[panel_id] = axis_lim
+                    else:
+                        self._panel_axis_limits.pop(panel_id, None)
                     self._last_plot_sig[panel_id] = plot_sig
                     t_draw = time.perf_counter()
                     self.figure_canvases[panel_id].draw()
