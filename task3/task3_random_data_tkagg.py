@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, NotRequired, TypedDict
 
+from matplotlib.artist import Artist
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -38,6 +40,7 @@ MARKER_STYLE_DISPLAY_NAMES: tuple[str, ...] = tuple(n for n, _ in MARKER_STYLE_O
 MARKER_STYLE_CHAR_BY_DISPLAY: dict[str, str] = dict(MARKER_STYLE_ORDER)
 MARKER_STYLE_CHOICES: tuple[str, ...] = tuple(c for _, c in MARKER_STYLE_ORDER)
 SLIDER_TICKS = 10_000
+MARKER_SLIDE_DEBOUNCE_MS = 24
 POLL_INTERVAL_MS = 3000
 MAX_SENSOR_ROWS = 10_000
 DATA_SOURCE_CHOICES: tuple[str, ...] = ("sensor", "file")
@@ -313,9 +316,10 @@ def draw_seaborn_markers(
     selected_index: int | None,
     figure_config: ChartFigureConfig,
     records: list[dict[str, object]] | None,
-) -> None:
+) -> list[Artist]:
     if not markers:
-        return
+        return []
+    out: list[Artist] = []
     palette = sns.color_palette("deep", max(len(markers), 3))
     ct = normalize_chart_type(chart_type)
     xy_offsets = ((10, 10), (10, -26), (-10, 12), (-10, -26), (24, 4), (-24, -8), (8, 20), (-18, 20))
@@ -323,15 +327,17 @@ def draw_seaborn_markers(
         xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
         st = normalize_marker_style(m.style)
         sel = selected_index is not None and i == selected_index
-        ax.scatter(
-            [xv],
-            [m.y_value],
-            marker=st,
-            s=220 if sel else 160,
-            color=palette[i % len(palette)],
-            edgecolors="black",
-            linewidths=3.6 if sel else 0.9,
-            zorder=16 if sel else 15,
+        out.append(
+            ax.scatter(
+                [xv],
+                [m.y_value],
+                marker=st,
+                s=220 if sel else 160,
+                color=palette[i % len(palette)],
+                edgecolors="black",
+                linewidths=3.6 if sel else 0.9,
+                zorder=16 if sel else 15,
+            )
         )
         parts: list[str] = []
         if m.label.strip():
@@ -348,15 +354,18 @@ def draw_seaborn_markers(
             )
         caption = "\n".join(parts)
         ox, oy = xy_offsets[i % len(xy_offsets)]
-        ax.annotate(
-            caption,
-            (xv, m.y_value),
-            xytext=(ox, oy),
-            textcoords="offset points",
-            fontsize=7,
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
-            zorder=20,
+        out.append(
+            ax.annotate(
+                caption,
+                (xv, m.y_value),
+                xytext=(ox, oy),
+                textcoords="offset points",
+                fontsize=7,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
+                zorder=20,
+            )
         )
+    return out
 
 
 def normalize_panel_data_source(panel: ChartPanelConfig) -> str:
@@ -557,17 +566,18 @@ def render_chart_figure(
     marker_selected_index: int | None,
     panel_id: str | None = None,
     chart_type_normalized: str | None = None,
-) -> None:
+) -> list[Artist]:
     pid = panel_id or "?"
     ct_label = chart_type_normalized or normalize_chart_type(chart_type)
     nrec = len(records) if records else 0
+    marker_artists: list[Artist] = []
     with _perf_region(PERF_GROUP_RENDER, "render_chart_figure", panel_id=pid, ct=ct_label, n=nrec):
         t_clear = time.perf_counter()
         figure.clear()
         figure.subplots_adjust(bottom=0.24)
         _perf((time.perf_counter() - t_clear) * 1000, PERF_GROUP_RENDER, "figure.clear_and_margin", panel_id=pid)
         if not records:
-            return
+            return []
         t_data = time.perf_counter()
         xk = config["x_axis_value_key"]
         yk = config["y_axis_values_key"]
@@ -587,7 +597,7 @@ def render_chart_figure(
         draw_series(ax, x, y, chart_type, panel_id=pid)
         if markers:
             t_markers = time.perf_counter()
-            draw_seaborn_markers(
+            marker_artists = draw_seaborn_markers(
                 ax,
                 chart_type=chart_type,
                 markers=markers,
@@ -627,6 +637,51 @@ def render_chart_figure(
         if ct_label != "bar":
             ax.margins(x=0)
         _perf((time.perf_counter() - t_style) * 1000, PERF_GROUP_RENDER, "title_labels_ticks_grid", panel_id=pid)
+    return marker_artists
+
+
+def update_chart_markers_only(
+    ax,
+    *,
+    marker_artists: list[Artist],
+    chart_type: str,
+    markers: tuple[ChartMarker, ...],
+    x_coords: list[object],
+    selected_index: int | None,
+    figure_config: ChartFigureConfig,
+    records: list[dict[str, object]] | None,
+    panel_id: str | None = None,
+) -> None:
+    pid = panel_id or "?"
+    ct_label = normalize_chart_type(chart_type)
+    with _perf_region(
+        PERF_GROUP_RENDER, "update_chart_markers_only", panel_id=pid, ct=ct_label, n_markers=len(markers)
+    ):
+        for a in marker_artists:
+            a.remove()
+        marker_artists.clear()
+        if not markers:
+            return
+        t_markers = time.perf_counter()
+        marker_artists.extend(
+            draw_seaborn_markers(
+                ax,
+                chart_type=chart_type,
+                markers=markers,
+                x_coords=x_coords,
+                selected_index=selected_index,
+                figure_config=figure_config,
+                records=records,
+            )
+        )
+        _perf(
+            (time.perf_counter() - t_markers) * 1000,
+            PERF_GROUP_RENDER,
+            "draw_seaborn_markers",
+            panel_id=pid,
+            n_markers=len(markers),
+            ct=ct_label,
+        )
 
 
 def status_for_state(state: SensorAppState, panels: list[ChartPanelConfig]) -> str:
@@ -818,6 +873,9 @@ class SensorDashboardApp:
         self.config_json_buttons: dict[str, tk.Button] = {}
         self._template_dir: str | None = None
         self._last_render_sig: dict[str, object] = {}
+        self._last_plot_sig: dict[str, object] = {}
+        self._marker_artists: dict[str, list[Artist]] = {}
+        self._marker_slide_after_ids: dict[str, str | None] = {}
 
         toolbar = tk.Frame(self.root)
         toolbar.pack(pady=5, padx=10, fill="x")
@@ -846,6 +904,13 @@ class SensorDashboardApp:
 
     def _on_window_close(self) -> None:
         self._cancel_poll()
+        for aid in self._marker_slide_after_ids.values():
+            if aid is not None:
+                try:
+                    self.root.after_cancel(aid)
+                except tk.TclError:
+                    pass
+        self._marker_slide_after_ids.clear()
         if self._bmp280 is not None:
             try:
                 self._bmp280.close()
@@ -1155,7 +1220,16 @@ class SensorDashboardApp:
             self.panels = ordered
             self.figures = {}
             self.figure_canvases = {}
+            for aid in self._marker_slide_after_ids.values():
+                if aid is not None:
+                    try:
+                        self.root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
+            self._marker_slide_after_ids.clear()
             self._last_render_sig.clear()
+            self._last_plot_sig.clear()
+            self._marker_artists.clear()
             self.chart_type_vars = {}
             self.marker_style_vars = {}
             self.marker_x_vars = {}
@@ -1251,6 +1325,14 @@ class SensorDashboardApp:
             return os.path.normpath(rel)
         base = self._template_dir if self._template_dir else os.getcwd()
         return os.path.normpath(os.path.join(base, rel))
+
+    def _plot_render_signature(self, panel_id: str) -> tuple[object, ...]:
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        records = self._state.datasets.get(panel_id)
+        ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
+        cfg_txt = chart_config_display_text(panel_figure_config(panel))
+        grid_on = self._state.grid_visible.get(panel_id, True)
+        return (cfg_txt, ct, grid_on, records_render_fingerprint(panel, records))
 
     def _chart_render_signature(self, panel_id: str) -> tuple[object, ...]:
         panel = next(p for p in self.panels if p["id"] == panel_id)
@@ -1552,7 +1634,7 @@ class SensorDashboardApp:
         xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
         self._replace_marker_at(panel_id, idx, replace(old, x_frac=float(xf)))
-        self._render_panel(panel_id)
+        self._schedule_marker_slide_render(panel_id)
 
     def _on_marker_y_slide(self, panel_id: str) -> None:
         if self._suppress_marker_slide:
@@ -1569,6 +1651,22 @@ class SensorDashboardApp:
         y_new = ymin + (ymax - ymin) * (tick / SLIDER_TICKS)
         old = cur[idx]
         self._replace_marker_at(panel_id, idx, replace(old, y_value=float(y_new)))
+        self._schedule_marker_slide_render(panel_id)
+
+    def _schedule_marker_slide_render(self, panel_id: str) -> None:
+        old = self._marker_slide_after_ids.get(panel_id)
+        if old is not None:
+            try:
+                self.root.after_cancel(old)
+            except tk.TclError:
+                pass
+        self._marker_slide_after_ids[panel_id] = self.root.after(
+            MARKER_SLIDE_DEBOUNCE_MS,
+            lambda pid=panel_id: self._on_marker_slide_debounced(pid),
+        )
+
+    def _on_marker_slide_debounced(self, panel_id: str) -> None:
+        self._marker_slide_after_ids[panel_id] = None
         self._render_panel(panel_id)
 
     def _sync_chart_types_from_ui(self) -> None:
@@ -1684,8 +1782,8 @@ class SensorDashboardApp:
         with _perf_region(PERF_GROUP_RENDER, "_render_panel", panel_id=panel_id):
             self._sync_chart_types_from_ui()
             self._normalize_marker_selection(panel_id)
-            sig = self._chart_render_signature(panel_id)
-            cached = sig == self._last_render_sig.get(panel_id)
+            full_sig = self._chart_render_signature(panel_id)
+            cached = full_sig == self._last_render_sig.get(panel_id)
             if cached:
                 _perf_emit(PERF_GROUP_RENDER, "·", "render_panel_cache_hit", None, panel_id=panel_id)
             else:
@@ -1694,26 +1792,68 @@ class SensorDashboardApp:
                 marks = self._state.markers.get(panel_id, ())
                 sel = self._state.marker_selected_index.get(panel_id) if marks else None
                 ct = normalize_chart_type(self._state.chart_types.get(panel_id, DEFAULT_CHART_TYPE))
-                render_chart_figure(
-                    self.figures[panel_id],
-                    records,
-                    ct,
-                    panel_figure_config(panel),
-                    show_grid=self._state.grid_visible.get(panel_id, True),
-                    markers=marks,
-                    marker_selected_index=sel,
-                    panel_id=panel_id,
-                    chart_type_normalized=ct,
+                fig_cfg = panel_figure_config(panel)
+                plot_sig = self._plot_render_signature(panel_id)
+                fig = self.figures[panel_id]
+                marker_only = (
+                    bool(records)
+                    and plot_sig == self._last_plot_sig.get(panel_id)
+                    and bool(fig.axes)
                 )
-                t_draw = time.perf_counter()
-                self.figure_canvases[panel_id].draw()
-                _perf(
-                    (time.perf_counter() - t_draw) * 1000,
-                    PERF_GROUP_RENDER,
-                    "canvas_tkagg.draw",
-                    panel_id=panel_id,
-                )
-                self._last_render_sig[panel_id] = sig
+                if marker_only:
+                    ax = fig.axes[0]
+                    t_mark = time.perf_counter()
+                    xk = panel["x_axis_value_key"]
+                    x, _x_is_time = coerce_time_axis_x(xk, [r[xk] for r in records])
+                    ma_list = self._marker_artists.setdefault(panel_id, [])
+                    update_chart_markers_only(
+                        ax,
+                        marker_artists=ma_list,
+                        chart_type=ct,
+                        markers=marks,
+                        x_coords=x,
+                        selected_index=sel,
+                        figure_config=fig_cfg,
+                        records=records,
+                        panel_id=panel_id,
+                    )
+                    _perf(
+                        (time.perf_counter() - t_mark) * 1000,
+                        PERF_GROUP_RENDER,
+                        "marker_only_update",
+                        panel_id=panel_id,
+                    )
+                    t_draw = time.perf_counter()
+                    self.figure_canvases[panel_id].draw_idle()
+                    _perf(
+                        (time.perf_counter() - t_draw) * 1000,
+                        PERF_GROUP_RENDER,
+                        "canvas_tkagg.draw_idle",
+                        panel_id=panel_id,
+                    )
+                else:
+                    new_m = render_chart_figure(
+                        fig,
+                        records,
+                        ct,
+                        fig_cfg,
+                        show_grid=self._state.grid_visible.get(panel_id, True),
+                        markers=marks,
+                        marker_selected_index=sel,
+                        panel_id=panel_id,
+                        chart_type_normalized=ct,
+                    )
+                    self._marker_artists[panel_id] = new_m
+                    self._last_plot_sig[panel_id] = plot_sig
+                    t_draw = time.perf_counter()
+                    self.figure_canvases[panel_id].draw()
+                    _perf(
+                        (time.perf_counter() - t_draw) * 1000,
+                        PERF_GROUP_RENDER,
+                        "canvas_tkagg.draw",
+                        panel_id=panel_id,
+                    )
+                self._last_render_sig[panel_id] = full_sig
             t_ui = time.perf_counter()
             self.status_label.config(text=status_for_state(self._state, self.panels))
             self._sync_marker_slider_ui(panel_id)
