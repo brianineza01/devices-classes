@@ -309,11 +309,10 @@ def sample_frac_from_data(coords: list[object], value: object) -> float:
     n = len(coords)
     if n == 1:
         return 0.5
+    keys = [_key_x(c) for c in coords]
+    lo_span = min(keys)
+    hi_span = max(keys)
     kv = _key_x(value)
-    k_first = _key_x(coords[0])
-    k_last = _key_x(coords[-1])
-    lo_span = min(k_first, k_last)
-    hi_span = max(k_first, k_last)
     if kv <= lo_span:
         return 0.0
     if kv >= hi_span:
@@ -1576,15 +1575,15 @@ class SensorDashboardApp:
                     kxs = [_key_x(v) for v in xc]
                     if len(kxs) > 1 and max(kxs) > min(kxs):
                         xi_fr = sample_frac_from_data(xc, picked.x_value)
-                        self.marker_x_vars[panel_id].set(
-                            max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
-                        )
+                        nx = max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
+                        if self.marker_x_vars[panel_id].get() != nx:
+                            self.marker_x_vars[panel_id].set(nx)
                     kys = [_key_x(v) for v in yc]
                     if len(kys) > 1 and max(kys) > min(kys):
                         yi_fr = sample_frac_from_data(yc, picked.y_value)
-                        self.marker_y_vars[panel_id].set(
-                            max(0, min(SLIDER_TICKS, round(yi_fr * SLIDER_TICKS)))
-                        )
+                        ny = max(0, min(SLIDER_TICKS, round(yi_fr * SLIDER_TICKS)))
+                        if self.marker_y_vars[panel_id].get() != ny:
+                            self.marker_y_vars[panel_id].set(ny)
                 finally:
                     self._suppress_marker_slide = False
 
