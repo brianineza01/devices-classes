@@ -242,6 +242,20 @@ def marker_style_display_name(char: str) -> str:
     return MARKER_STYLE_DISPLAY_NAMES[0]
 
 
+def x_domain_endpoints(x_coords: list[object]) -> tuple[object, object]:
+    if not x_coords:
+        raise ValueError("x_coords must not be empty")
+    if len(x_coords) == 1:
+        return x_coords[0], x_coords[0]
+    if all(isinstance(v, datetime) for v in x_coords):
+        lo = min(x_coords)
+        hi = max(x_coords)
+        return lo, hi
+    lo = min(x_coords, key=float)
+    hi = max(x_coords, key=float)
+    return lo, hi
+
+
 def interpolate_x_coord(x_coords: list[object], frac: float) -> object:
     if not x_coords:
         raise ValueError("x_coords must not be empty")
@@ -249,8 +263,7 @@ def interpolate_x_coord(x_coords: list[object], frac: float) -> object:
     n = len(x_coords)
     if n == 1:
         return x_coords[0]
-    a = x_coords[0]
-    b = x_coords[-1]
+    a, b = x_domain_endpoints(x_coords)
     if isinstance(a, datetime) and isinstance(b, datetime):
         span_sec = (b - a).total_seconds()
         if span_sec <= 0:
@@ -409,7 +422,7 @@ def marker_readout_strings(
     if not x:
         return None
     xi = interpolate_x_coord(x, m.x_frac)
-    t0, t1 = x[0], x[-1]
+    t0, t1 = x_domain_endpoints(x)
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
     return xs_s, ys_s
@@ -429,7 +442,7 @@ def marker_readout_strings_figure(
     if not x:
         return None
     xi = interpolate_x_coord(x, m.x_frac)
-    t0, t1 = x[0], x[-1]
+    t0, t1 = x_domain_endpoints(x)
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
     return xs_s, ys_s
@@ -598,7 +611,7 @@ def render_chart_figure(
         ax.set_xlabel(format_axis_label(config["x_axis_label"], xu))
         ax.set_ylabel(format_axis_label(config["y_axis_label"], yu))
         if x_is_time and len(x) >= 2:
-            t_dt0, t_dt1 = x[0], x[-1]
+            t_dt0, t_dt1 = x_domain_endpoints(x)
             if isinstance(t_dt0, datetime) and isinstance(t_dt1, datetime):
                 span = t_dt1 - t_dt0
                 fmt = "%H:%M:%S" if span.days == 0 else "%Y-%m-%d %H:%M:%S"
@@ -611,6 +624,8 @@ def render_chart_figure(
             ax.grid(True, linestyle="--", alpha=0.4)
         else:
             ax.grid(False)
+        if ct_label != "bar":
+            ax.margins(x=0)
         _perf((time.perf_counter() - t_style) * 1000, PERF_GROUP_RENDER, "title_labels_ticks_grid", panel_id=pid)
 
 
