@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Iterable, NotRequired, TypedDict
+from typing import NotRequired, TypedDict
 
 from matplotlib.artist import Artist
 
@@ -265,18 +265,18 @@ def _key_x(v: object) -> float:
     return float(v)
 
 
-def data_x_at_sample_frac(x_coords: list[object], frac: float) -> object:
-    if not x_coords:
-        raise ValueError("x_coords must not be empty")
+def data_at_sample_frac(coords: list[object], frac: float) -> object:
+    if not coords:
+        raise ValueError("coords must not be empty")
     frac = max(0.0, min(1.0, frac))
-    n = len(x_coords)
+    n = len(coords)
     if n == 1:
-        return x_coords[0]
+        return coords[0]
     pos = frac * (n - 1)
     i0 = int(math.floor(pos))
     i1 = min(i0 + 1, n - 1)
     t = pos - i0
-    a, b = x_coords[i0], x_coords[i1]
+    a, b = coords[i0], coords[i1]
     if isinstance(a, datetime) and isinstance(b, datetime):
         span_sec = (b - a).total_seconds()
         if span_sec <= 0:
@@ -303,15 +303,15 @@ def _segment_t(a: object, b: object, xv: object) -> float | None:
     return (fx - fa) / den
 
 
-def sample_frac_from_data_x(x_coords: list[object], x_value: object) -> float:
-    if not x_coords:
+def sample_frac_from_data(coords: list[object], value: object) -> float:
+    if not coords:
         return 0.5
-    n = len(x_coords)
+    n = len(coords)
     if n == 1:
         return 0.5
-    kv = _key_x(x_value)
-    k_first = _key_x(x_coords[0])
-    k_last = _key_x(x_coords[-1])
+    kv = _key_x(value)
+    k_first = _key_x(coords[0])
+    k_last = _key_x(coords[-1])
     lo_span = min(k_first, k_last)
     hi_span = max(k_first, k_last)
     if kv <= lo_span:
@@ -319,12 +319,12 @@ def sample_frac_from_data_x(x_coords: list[object], x_value: object) -> float:
     if kv >= hi_span:
         return 1.0
     for i in range(n - 1):
-        a, b = x_coords[i], x_coords[i + 1]
+        a, b = coords[i], coords[i + 1]
         ka, kb = _key_x(a), _key_x(b)
         seg_lo, seg_hi = min(ka, kb), max(ka, kb)
         if kv < seg_lo or kv > seg_hi:
             continue
-        tv = _segment_t(a, b, x_value)
+        tv = _segment_t(a, b, value)
         if tv is None:
             continue
         if tv < -1e-9 or tv > 1 + 1e-9:
@@ -342,7 +342,7 @@ def marker_axes_x(ax, chart_type: str, x_coords: list[object], x_value: object) 
     if ct == "bar" and n > 0:
         patches = ax.patches
         if len(patches) >= n:
-            frac = sample_frac_from_data_x(x_coords, x_value)
+            frac = sample_frac_from_data(x_coords, x_value)
             pos = max(0.0, min(1.0, frac)) * (n - 1)
             i0 = int(math.floor(pos))
             i1 = min(i0 + 1, n - 1)
@@ -356,17 +356,6 @@ def marker_axes_x(ax, chart_type: str, x_coords: list[object], x_value: object) 
                 return bar_center(i0)
             return bar_center(i0) * (1.0 - t) + bar_center(i1) * t
     return x_value
-
-
-def float_bounds_from_numeric(y_numeric: Iterable[object]) -> tuple[float, float]:
-    ys = [float(v) for v in y_numeric]
-    lo = min(ys)
-    hi = max(ys)
-    if hi <= lo:
-        pad = abs(lo) * 0.05 + 1.0
-        return lo - pad, hi + pad
-    margin = (hi - lo) * 0.05
-    return lo - margin, hi + margin
 
 
 def draw_seaborn_markers(
@@ -1430,14 +1419,6 @@ class SensorDashboardApp:
         except OSError as e:
             messagebox.showerror("Save data", str(e))
 
-    def _panel_y_bounds(self, panel_id: str) -> tuple[float, float] | None:
-        panel = next(p for p in self.panels if p["id"] == panel_id)
-        rows = self._state.datasets.get(panel_id)
-        if not rows:
-            return None
-        yk = panel["y_axis_values_key"]
-        return float_bounds_from_numeric(r[yk] for r in rows)
-
     def _effective_marker_index(self, panel_id: str) -> int | None:
         cur = tuple(self._state.markers.get(panel_id, ()))
         if not cur:
@@ -1582,25 +1563,28 @@ class SensorDashboardApp:
                 x_scale.pack(fill="x")
             y_scale.config(state=tk.NORMAL)
             x_scale.config(state=tk.NORMAL)
-            bounds = self._panel_y_bounds(panel_id)
             idx = self._effective_marker_index(panel_id)
-            if idx is not None and bounds:
+            if idx is not None and records:
                 picked = cur[idx]
-                ymin, ymax = bounds
                 self._suppress_marker_slide = True
                 try:
                     xk = panel["x_axis_value_key"]
+                    yk = panel["y_axis_values_key"]
                     xv_raw = [r[xk] for r in records]
                     xc, _ = coerce_time_axis_x(xk, xv_raw)
-                    xi_fr = sample_frac_from_data_x(xc, picked.x_value)
-                    self.marker_x_vars[panel_id].set(
-                        max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
-                    )
-                    if ymax > ymin:
-                        ty = round((picked.y_value - ymin) / (ymax - ymin) * SLIDER_TICKS)
-                        self.marker_y_vars[panel_id].set(max(0, min(SLIDER_TICKS, ty)))
-                    else:
-                        self.marker_y_vars[panel_id].set(SLIDER_TICKS // 2)
+                    yc = [r[yk] for r in records]
+                    kxs = [_key_x(v) for v in xc]
+                    if len(kxs) > 1 and max(kxs) > min(kxs):
+                        xi_fr = sample_frac_from_data(xc, picked.x_value)
+                        self.marker_x_vars[panel_id].set(
+                            max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
+                        )
+                    kys = [_key_x(v) for v in yc]
+                    if len(kys) > 1 and max(kys) > min(kys):
+                        yi_fr = sample_frac_from_data(yc, picked.y_value)
+                        self.marker_y_vars[panel_id].set(
+                            max(0, min(SLIDER_TICKS, round(yi_fr * SLIDER_TICKS)))
+                        )
                 finally:
                     self._suppress_marker_slide = False
 
@@ -1671,18 +1655,18 @@ class SensorDashboardApp:
         self._render_panel(panel_id)
 
     def _add_marker(self, panel_id: str) -> None:
-        bounds = self._panel_y_bounds(panel_id)
-        if bounds is None:
-            return
-        ymin, ymax = bounds
-        style = normalize_marker_style(self.marker_style_vars[panel_id].get())
-        y_mid = ymin + (ymax - ymin) * 0.5
-        prev = tuple(self._state.markers.get(panel_id, ()))
         panel = next(p for p in self.panels if p["id"] == panel_id)
         rows = self._state.datasets.get(panel_id) or []
+        if not rows:
+            return
+        style = normalize_marker_style(self.marker_style_vars[panel_id].get())
+        prev = tuple(self._state.markers.get(panel_id, ()))
         xk = panel["x_axis_value_key"]
+        yk = panel["y_axis_values_key"]
         xc, _ = coerce_time_axis_x(xk, [r[xk] for r in rows])
-        x_mid = data_x_at_sample_frac(xc, 0.5) if xc else 0.0
+        yc = [r[yk] for r in rows]
+        x_mid = data_at_sample_frac(xc, 0.5)
+        y_mid = float(data_at_sample_frac(yc, 0.5))
         nm = ChartMarker(
             style=style,
             x_value=x_mid,
@@ -1712,25 +1696,27 @@ class SensorDashboardApp:
         cur = tuple(self._state.markers.get(panel_id, ()))
         xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
-        x_new = data_x_at_sample_frac(xc, xf)
+        x_new = data_at_sample_frac(xc, xf)
         self._replace_marker_at(panel_id, idx, replace(old, x_value=x_new))
         self._schedule_marker_slide_render(panel_id)
 
     def _on_marker_y_slide(self, panel_id: str) -> None:
         if self._suppress_marker_slide:
             return
-        bounds = self._panel_y_bounds(panel_id)
-        if bounds is None:
-            return
-        ymin, ymax = bounds
         idx = self._effective_marker_index(panel_id)
         if idx is None:
             return
+        records = self._state.datasets.get(panel_id)
+        if not records:
+            return
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        yk = panel["y_axis_values_key"]
+        yc = [r[yk] for r in records]
         cur = tuple(self._state.markers.get(panel_id, ()))
-        tick = self.marker_y_vars[panel_id].get()
-        y_new = ymin + (ymax - ymin) * (tick / SLIDER_TICKS)
+        yf = max(0.0, min(1.0, self.marker_y_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
-        self._replace_marker_at(panel_id, idx, replace(old, y_value=float(y_new)))
+        y_new = float(data_at_sample_frac(yc, yf))
+        self._replace_marker_at(panel_id, idx, replace(old, y_value=y_new))
         self._schedule_marker_slide_render(panel_id)
 
     def _schedule_marker_slide_render(self, panel_id: str) -> None:
