@@ -211,7 +211,7 @@ def records_render_fingerprint(
 @dataclass(frozen=True)
 class ChartMarker:
     style: str
-    x_frac: float
+    x_value: object
     y_value: float
     label: str = ""
 
@@ -259,28 +259,90 @@ def x_domain_endpoints(x_coords: list[object]) -> tuple[object, object]:
     return lo, hi
 
 
-def interpolate_x_coord(x_coords: list[object], frac: float) -> object:
+def _key_x(v: object) -> float:
+    if isinstance(v, datetime):
+        return v.timestamp()
+    return float(v)
+
+
+def data_x_at_sample_frac(x_coords: list[object], frac: float) -> object:
     if not x_coords:
         raise ValueError("x_coords must not be empty")
     frac = max(0.0, min(1.0, frac))
     n = len(x_coords)
     if n == 1:
         return x_coords[0]
-    a, b = x_domain_endpoints(x_coords)
+    pos = frac * (n - 1)
+    i0 = int(math.floor(pos))
+    i1 = min(i0 + 1, n - 1)
+    t = pos - i0
+    a, b = x_coords[i0], x_coords[i1]
     if isinstance(a, datetime) and isinstance(b, datetime):
         span_sec = (b - a).total_seconds()
         if span_sec <= 0:
             return a
-        return a + timedelta(seconds=span_sec * frac)
-    return float(a) + (float(b) - float(a)) * frac
+        return a + timedelta(seconds=span_sec * t)
+    return float(a) + (float(b) - float(a)) * t
 
 
-def marker_axes_x(ax, chart_type: str, x_coords: list[object], frac: float) -> object:
+def _segment_t(a: object, b: object, xv: object) -> float | None:
+    if isinstance(a, datetime) and isinstance(b, datetime):
+        if not isinstance(xv, datetime):
+            return None
+        span_sec = (b - a).total_seconds()
+        if span_sec == 0:
+            return 0.0 if xv == a else None
+        return (xv - a).total_seconds() / span_sec
+    try:
+        fa, fb, fx = float(a), float(b), float(xv)
+    except (TypeError, ValueError):
+        return None
+    den = fb - fa
+    if den == 0:
+        return 0.0 if fx == fa else None
+    return (fx - fa) / den
+
+
+def sample_frac_from_data_x(x_coords: list[object], x_value: object) -> float:
+    if not x_coords:
+        return 0.5
+    n = len(x_coords)
+    if n == 1:
+        return 0.5
+    kv = _key_x(x_value)
+    k_first = _key_x(x_coords[0])
+    k_last = _key_x(x_coords[-1])
+    lo_span = min(k_first, k_last)
+    hi_span = max(k_first, k_last)
+    if kv <= lo_span:
+        return 0.0
+    if kv >= hi_span:
+        return 1.0
+    for i in range(n - 1):
+        a, b = x_coords[i], x_coords[i + 1]
+        ka, kb = _key_x(a), _key_x(b)
+        seg_lo, seg_hi = min(ka, kb), max(ka, kb)
+        if kv < seg_lo or kv > seg_hi:
+            continue
+        tv = _segment_t(a, b, x_value)
+        if tv is None:
+            continue
+        if tv < -1e-9 or tv > 1 + 1e-9:
+            continue
+        tv = max(0.0, min(1.0, tv))
+        return (i + tv) / (n - 1)
+    return (
+        max(0.0, min(1.0, (kv - lo_span) / (hi_span - lo_span))) if hi_span > lo_span else 0.5
+    )
+
+
+def marker_axes_x(ax, chart_type: str, x_coords: list[object], x_value: object) -> object:
     ct = normalize_chart_type(chart_type)
     n = len(x_coords)
     if ct == "bar" and n > 0:
         patches = ax.patches
         if len(patches) >= n:
+            frac = sample_frac_from_data_x(x_coords, x_value)
             pos = max(0.0, min(1.0, frac)) * (n - 1)
             i0 = int(math.floor(pos))
             i1 = min(i0 + 1, n - 1)
@@ -293,7 +355,7 @@ def marker_axes_x(ax, chart_type: str, x_coords: list[object], frac: float) -> o
             if i0 == i1:
                 return bar_center(i0)
             return bar_center(i0) * (1.0 - t) + bar_center(i1) * t
-    return interpolate_x_coord(x_coords, frac)
+    return x_value
 
 
 def float_bounds_from_numeric(y_numeric: Iterable[object]) -> tuple[float, float]:
@@ -324,7 +386,7 @@ def draw_seaborn_markers(
     ct = normalize_chart_type(chart_type)
     xy_offsets = ((10, 10), (10, -26), (-10, 12), (-10, -26), (24, 4), (-24, -8), (8, 20), (-18, 20))
     for i, m in enumerate(markers):
-        xv = marker_axes_x(ax, ct, x_coords, m.x_frac)
+        xv = marker_axes_x(ax, ct, x_coords, m.x_value)
         st = normalize_marker_style(m.style)
         sel = selected_index is not None and i == selected_index
         out.append(
@@ -348,7 +410,7 @@ def draw_seaborn_markers(
             parts.extend((xs_s, ys_s))
         else:
             yu = figure_config.get("y_axis_unit")
-            parts.append(f"{m.x_frac:.0%}")
+            parts.append(_annotate_x_text(m.x_value))
             parts.append(
                 _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None),
             )
@@ -430,7 +492,7 @@ def marker_readout_strings(
     x, x_is_time = coerce_time_axis_x(xk, xs)
     if not x:
         return None
-    xi = interpolate_x_coord(x, m.x_frac)
+    xi = m.x_value
     t0, t1 = x_domain_endpoints(x)
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
@@ -450,7 +512,7 @@ def marker_readout_strings_figure(
     x, x_is_time = coerce_time_axis_x(xk, xs)
     if not x:
         return None
-    xi = interpolate_x_coord(x, m.x_frac)
+    xi = m.x_value
     t0, t1 = x_domain_endpoints(x)
     xs_s = _interpolated_x_display(xi, x_is_time, t0, t1)
     ys_s = _format_y_readout(m.y_value, yu if yu and str(yu).strip() else None)
@@ -474,7 +536,7 @@ def marker_axis_readout_lines(
             x_lines.append(f"{pfx}{xs_s}")
             y_lines.append(f"{pfx}{ys_s}")
         else:
-            x_lines.append(f"{pfx}{m.x_frac:.0%}")
+            x_lines.append(f"{pfx}{_annotate_x_text(m.x_value)}")
             y_lines.append(_format_y_readout(m.y_value, yu))
     return "\n".join(x_lines), "\n".join(y_lines)
 
@@ -491,7 +553,7 @@ def format_marker_list_label(
     if rd:
         xs, ys = rd
         return f"{head}  {st}  {xs}  {ys}"
-    return f"{head}  {st}  x={m.x_frac:.0%}  y={m.y_value:.4g}"
+    return f"{head}  {st}  x={_annotate_x_text(m.x_value)}  y={m.y_value:.4g}"
 
 
 def draw_series(
@@ -1527,7 +1589,13 @@ class SensorDashboardApp:
                 ymin, ymax = bounds
                 self._suppress_marker_slide = True
                 try:
-                    self.marker_x_vars[panel_id].set(max(0, min(SLIDER_TICKS, round(picked.x_frac * SLIDER_TICKS))))
+                    xk = panel["x_axis_value_key"]
+                    xv_raw = [r[xk] for r in records]
+                    xc, _ = coerce_time_axis_x(xk, xv_raw)
+                    xi_fr = sample_frac_from_data_x(xc, picked.x_value)
+                    self.marker_x_vars[panel_id].set(
+                        max(0, min(SLIDER_TICKS, round(xi_fr * SLIDER_TICKS)))
+                    )
                     if ymax > ymin:
                         ty = round((picked.y_value - ymin) / (ymax - ymin) * SLIDER_TICKS)
                         self.marker_y_vars[panel_id].set(max(0, min(SLIDER_TICKS, ty)))
@@ -1544,7 +1612,7 @@ class SensorDashboardApp:
                 else:
                     yu = panel.get("y_axis_unit")
                     ry.config(text=_format_y_readout(picked.y_value, yu if yu and str(yu).strip() else None))
-                    rx.config(text=f"{picked.x_frac:.0%}")
+                    rx.config(text=_annotate_x_text(picked.x_value))
             else:
                 lx, ly = marker_axis_readout_lines(panel, records, cur)
                 ry.config(text=ly)
@@ -1610,9 +1678,14 @@ class SensorDashboardApp:
         style = normalize_marker_style(self.marker_style_vars[panel_id].get())
         y_mid = ymin + (ymax - ymin) * 0.5
         prev = tuple(self._state.markers.get(panel_id, ()))
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        rows = self._state.datasets.get(panel_id) or []
+        xk = panel["x_axis_value_key"]
+        xc, _ = coerce_time_axis_x(xk, [r[xk] for r in rows])
+        x_mid = data_x_at_sample_frac(xc, 0.5) if xc else 0.0
         nm = ChartMarker(
             style=style,
-            x_frac=0.5,
+            x_value=x_mid,
             y_value=float(y_mid),
             label=f"Marker {len(prev) + 1}",
         )
@@ -1630,10 +1703,17 @@ class SensorDashboardApp:
         idx = self._effective_marker_index(panel_id)
         if idx is None:
             return
+        records = self._state.datasets.get(panel_id)
+        if not records:
+            return
+        panel = next(p for p in self.panels if p["id"] == panel_id)
+        xk = panel["x_axis_value_key"]
+        xc, _ = coerce_time_axis_x(xk, [r[xk] for r in records])
         cur = tuple(self._state.markers.get(panel_id, ()))
         xf = max(0.0, min(1.0, self.marker_x_vars[panel_id].get() / SLIDER_TICKS))
         old = cur[idx]
-        self._replace_marker_at(panel_id, idx, replace(old, x_frac=float(xf)))
+        x_new = data_x_at_sample_frac(xc, xf)
+        self._replace_marker_at(panel_id, idx, replace(old, x_value=x_new))
         self._schedule_marker_slide_render(panel_id)
 
     def _on_marker_y_slide(self, panel_id: str) -> None:
